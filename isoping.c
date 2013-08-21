@@ -22,9 +22,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef CLOCK_MONOTONIC_RAW
+#define CLOCK_MONOTONIC_RAW 4
+#endif
+
 #define MAGIC 0x424c4950
 #define SERVER_PORT 4948
-#define USEC_PER_PKT (100*1000)
+#define DEFAULT_PACKETS_PER_SEC 10.0
 
 // A 'cycle' is the amount of time we can assume our calibration between
 // the local and remote monotonic clocks is reasonably valid.  It seems
@@ -51,6 +55,7 @@ struct Packet {
   uint32_t id;        // sequential packet id number
   uint32_t txtime;    // transmitter's monotonic time when pkt was sent
   uint32_t clockdiff; // estimate of (transmitter's clk) - (receiver's clk)
+  uint32_t usec_per_pkt; // microseconds of delay between packets
   uint32_t num_lost;  // number of pkts transmitter expected to get but didn't
   uint32_t first_ack; // starting index in acks[] circular buffer
   struct {
@@ -64,7 +69,7 @@ struct Packet {
 int want_to_die;
 
 
-void sighandler(int sig) {
+static void sighandler(int sig) {
   want_to_die = 1;
 }
 
@@ -78,39 +83,58 @@ void sighandler(int sig) {
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 
-static uint32_t ustime(void) {
+static uint64_t ustime64(void) {
   static mach_timebase_info_data_t timebase;
   if (!timebase.denom) mach_timebase_info(&timebase);
-  uint32_t result = (mach_absolute_time() * timebase.numer /
+  uint64_t result = (mach_absolute_time() * timebase.numer /
                      timebase.denom / 1000);
   return !result ? 1 : result;
 }
 #else
-static uint32_t ustime(void) {
+static uint64_t ustime64(void) {
+  // CLOCK_MONOTONIC_RAW, when available, is not subject to NTP speed
+  // adjustments while CLOCK_MONOTONIC is.  You might expect NTP speed
+  // adjustments to make things better if we're trying to sync timings
+  // between two machines, but at least our ntpd is pretty bad at making
+  // adjustments, so it tends the vary the speed wildly in order to kind
+  // of oscillate around the right time.  Experimentally, CLOCK_MONOTONIC_RAW
+  // creates less trouble for isoping's use case.
   struct timespec ts;
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
-    perror("clock_gettime");
-    exit(98); // really should never happen, so don't try to recover
+  if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) < 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
+      perror("clock_gettime");
+      exit(98); // really should never happen, so don't try to recover
+    }
   }
-  uint32_t result = ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+  uint64_t result = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
   return !result ? 1 : result;
 }
 #endif
 
 
-void usage_and_die(char *argv0) {
+static uint32_t ustime(void) {
+  return (uint32_t)ustime64();
+}
+
+
+static void usage_and_die(char *argv0) {
   fprintf(stderr,
           "\n"
           "Usage: %s                          (server mode)\n"
-          "   or: %s <server-hostname-or-ip>  (client mode)\n",
-          argv0, argv0);
+          "   or: %s <server-hostname-or-ip>  (client mode)\n"
+          "\n"
+          "      -f <lines/sec>  max output lines per second\n"
+          "      -r <pps>        packets per second (default=%g)\n"
+          "      -q              quiet mode (don't print packets)\n"
+          "      -T              print timestamps\n",
+          argv0, argv0, (double)DEFAULT_PACKETS_PER_SEC);
   exit(99);
 }
 
 
 // Render the given sockaddr as a string.  (Uses a static internal buffer
 // which is overwritten each time.)
-const char *sockaddr_to_str(struct sockaddr *sa) {
+static const char *sockaddr_to_str(struct sockaddr *sa) {
   static char addrbuf[128];
   void *aptr;
 
@@ -133,13 +157,72 @@ const char *sockaddr_to_str(struct sockaddr *sa) {
 }
 
 
+// Print the timestamp corresponding to the current time.
+// Deliberately the same format as tcpdump uses, so we can easily sort and
+// correlate messages between isoping and tcpdump.
+static void print_timestamp(uint32_t when) {
+  uint64_t now = ustime64();
+  int32_t nowdiff = DIFF(now, when);
+  uint64_t when64 = now - nowdiff;
+  time_t t = when64 / 1000000;
+  struct tm tm;
+  memset(&tm, 0, sizeof(tm));
+  localtime_r(&t, &tm);
+  printf("%02d:%02d:%02d.%06d ", tm.tm_hour, tm.tm_min, tm.tm_sec,
+         (int)(when64 % 1000000));
+}
+
+
+static double onepass_stddev(long long sumsq, long long sum, long long count) {
+  // Incremental standard deviation calculation, without needing to know the
+  // mean in advance.  See:
+  // http://mathcentral.uregina.ca/QQ/database/QQ.09.02/carlos1.html
+  long long numer = (count * sumsq) - (sum * sum);
+  long long denom = count * (count - 1);
+  return sqrt(DIV(numer, denom));
+}
+
+
 int main(int argc, char **argv) {
   int is_server = 1;
   struct sockaddr_in6 listenaddr, rxaddr, last_rxaddr;
   struct sockaddr *remoteaddr = NULL;
   socklen_t remoteaddr_len = 0, rxaddr_len = 0;
   struct addrinfo *ai = NULL;
-  int sock = -1;
+  int sock = -1, want_timestamps = 0, quiet = 0;
+  double packets_per_sec = DEFAULT_PACKETS_PER_SEC, prints_per_sec = -1;
+
+  int c;
+  while ((c = getopt(argc, argv, "f:r:qTh?")) >= 0) {
+    switch (c) {
+    case 'f':
+      prints_per_sec = atof(optarg);
+      if (prints_per_sec <= 0) {
+        fprintf(stderr, "%s: lines per second must be >= 0\n", argv[0]);
+        return 99;
+      }
+      break;
+    case 'r':
+      packets_per_sec = atof(optarg);
+      if (packets_per_sec < 0.001 || packets_per_sec > 1e6) {
+        fprintf(stderr, "%s: packets per sec (-r) must be 0.001..1000000\n",
+                argv[0]);
+        return 99;
+      }
+      break;
+    case 'q':
+      quiet = 1;
+      break;
+    case 'T':
+      want_timestamps = 1;
+      break;
+    case 'h':
+    case '?':
+    default:
+      usage_and_die(argv[0]);
+      break;
+    }
+  }
 
   sock = socket(PF_INET6, SOCK_DGRAM, 0);
   if (sock < 0) {
@@ -147,7 +230,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (argc <= 1) {
+  if (argc - optind == 0) {
     is_server = 1;
     sock = socket(PF_INET6, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -169,16 +252,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "server listening at [%s]:%d\n",
            sockaddr_to_str((struct sockaddr *)&listenaddr),
            ntohs(listenaddr.sin6_port));
-  } else if (argc <= 2) {
+  } else if (argc - optind == 1) {
+    const char *remotename = argv[optind];
     is_server = 0;
     struct addrinfo hints = {
-      ai_flags: AI_ADDRCONFIG | AI_V4MAPPED,
-      ai_family: AF_INET6,
-      ai_socktype: SOCK_DGRAM,
+      .ai_flags = AI_ADDRCONFIG | AI_V4MAPPED,
+      .ai_family = AF_INET6,
+      .ai_socktype = SOCK_DGRAM,
     };
-    int err = getaddrinfo(argv[1], STR(SERVER_PORT), &hints, &ai);
+    int err = getaddrinfo(remotename, STR(SERVER_PORT), &hints, &ai);
     if (err != 0 || !ai) {
-      fprintf(stderr, "getaddrinfo(%s): %s\n", argv[1], gai_strerror(err));
+      fprintf(stderr, "getaddrinfo(%s): %s\n", remotename, gai_strerror(err));
       return 1;
     }
     fprintf(stderr, "connecting to %s...\n", sockaddr_to_str(ai->ai_addr));
@@ -191,6 +275,9 @@ int main(int argc, char **argv) {
   } else {
     usage_and_die(argv[0]);
   }
+
+  int32_t usec_per_pkt = 1e6 / packets_per_sec;
+  int32_t usec_per_print = prints_per_sec > 0 ? 1e6 / prints_per_sec : 0;
 
   // WARNING: lots of math below relies on well-defined uint32/int32
   // arithmetic overflow behaviour, plus the fact that when we subtract
@@ -207,18 +294,25 @@ int main(int argc, char **argv) {
   int32_t min_cycle_rxdiff = 0;  // smallest packet delay seen this cycle
   uint32_t next_cycle = 0;       // time when next cycle begins
   uint32_t now = ustime();       // current time
-  uint32_t next_send = now + USEC_PER_PKT;  // time when we'll send next pkt
+  uint32_t next_send = now + usec_per_pkt;  // time when we'll send next pkt
   uint32_t num_lost = 0;         // number of rx packets not received
   int next_txack_index = 0;      // next array item to fill in tx.acks
   struct Packet tx, rx;          // transmit and received packet buffers
   char last_ackinfo[128] = "";   // human readable format of latest ack
-  // Packet count, total time, and total variance (sum of squares of diff
-  // from the mean) for all packets sent and received, respectively.
-  long long lat_tx_count = 0, lat_tx_sum = 0, lat_tx_var_sum = 0;
-  long long lat_rx_count = 0, lat_rx_sum = 0, lat_rx_var_sum = 0;
+  uint32_t last_print = now - usec_per_pkt;  // time of last packet printout
+  // Packet statistics counters for transmit and receive directions.
+  long long lat_tx = 0, lat_tx_min = 0x7fffffff, lat_tx_max = 0,
+      lat_tx_count = 0, lat_tx_sum = 0, lat_tx_var_sum = 0;
+  long long lat_rx = 0, lat_rx_min = 0x7fffffff, lat_rx_max = 0,
+      lat_rx_count = 0, lat_rx_sum = 0, lat_rx_var_sum = 0;
 
   memset(&tx, 0, sizeof(tx));
-  signal(SIGINT, sighandler);
+
+  struct sigaction act = {
+    .sa_handler = sighandler,
+    .sa_flags = SA_RESETHAND,
+  };
+  sigaction(SIGINT, &act, NULL);
 
   while (!want_to_die) {
     fd_set rfds;
@@ -227,6 +321,7 @@ int main(int argc, char **argv) {
     struct timeval tv;
     tv.tv_sec = 0;
 
+    now = ustime();
     if (DIFF(next_send, now) < 0) {
       tv.tv_usec = 0;
     } else {
@@ -243,8 +338,9 @@ int main(int argc, char **argv) {
     if (remoteaddr && DIFF(now, next_send) >= 0) {
       tx.magic = htonl(MAGIC);
       tx.id = htonl(next_tx_id++);
+      tx.usec_per_pkt = htonl(usec_per_pkt);
       tx.txtime = htonl(next_send);
-      tx.clockdiff = htonl(start_rxtime - start_rtxtime);
+      tx.clockdiff = start_rtxtime ? htonl(start_rxtime - start_rtxtime) : 0;
       tx.num_lost = htonl(num_lost);
       tx.first_ack = htonl(next_txack_index);
       // note: tx.acks[] is filled in incrementally; we just transmit the
@@ -259,15 +355,16 @@ int main(int argc, char **argv) {
         }
       } else {
         if (send(sock, &tx, sizeof(tx), 0) < 0) {
+          int e = errno;
           perror("send");
+          if (e == ECONNREFUSED) return 2;
         }
       }
-
       if (is_server && DIFF(now, last_rxtime) > 60*1000*1000) {
         fprintf(stderr, "client disconnected.\n");
         remoteaddr = NULL;
       }
-      next_send += USEC_PER_PKT;
+      next_send += usec_per_pkt;
     }
 
     if (nfds > 0) {
@@ -276,7 +373,9 @@ int main(int argc, char **argv) {
       ssize_t got = recvfrom(sock, &rx, sizeof(rx), 0,
                              (struct sockaddr *)&rxaddr, &rxaddr_len);
       if (got < 0) {
+        int e = errno;
         perror("recvfrom");
+        if (!is_server && e == ECONNREFUSED) return 2;
         continue;
       }
       if (got != sizeof(rx) || rx.magic != htonl(MAGIC)) {
@@ -304,6 +403,7 @@ int main(int argc, char **argv) {
           start_rtxtime = start_rxtime = 0;
           num_lost = 0;
           next_txack_index = 0;
+          usec_per_pkt = ntohl(rx.usec_per_pkt);
           memset(&tx, 0, sizeof(tx));
         }
       }
@@ -313,7 +413,7 @@ int main(int argc, char **argv) {
       // system's clock will be skewed vs. ours.  (We use CLOCK_MONOTONIC
       // instead of CLOCK_REALTIME, so unless we figure out the skew offset,
       // it's essentially meaningless to compare the two values.)  We can
-      // however assume that block clocks are ticking at 1 microsecond per
+      // however assume that both clocks are ticking at 1 microsecond per
       // tick... except for inevitable clock rate errors, which we have to
       // account for occasionally.
 
@@ -322,14 +422,14 @@ int main(int argc, char **argv) {
       if (!next_rx_id) {
         // The remote txtime is told to us by the sender, so it is always
         // perfectly correct... but it uses the sender's clock.
-        start_rtxtime = txtime - id * USEC_PER_PKT;
+        start_rtxtime = txtime - id * usec_per_pkt;
 
         // The receive time uses our own clock and is estimated by us, so
         // it needs to be corrected over time because:
         //   a) the two clocks inevitably run at slightly different speeds;
         //   b) there's an unknown, variable, network delay between tx and rx.
         // Here, we're just assigning an initial estimate.
-        start_rxtime = rxtime - id * USEC_PER_PKT;
+        start_rxtime = rxtime - id * usec_per_pkt;
 
         min_cycle_rxdiff = 0;
         next_rx_id = id;
@@ -361,16 +461,16 @@ int main(int argc, char **argv) {
       }
 
       // fix up the clock offset if there's any drift.
-      tmpdiff = DIFF(rxtime, start_rxtime + id * USEC_PER_PKT);
-      if (tmpdiff < 0) {
+      tmpdiff = DIFF(rxtime, start_rxtime + id * usec_per_pkt);
+      if (tmpdiff < -20) {
         // packet arrived before predicted time, so prediction was based on
         // a packet that was "slow" before, or else one of our clocks is
         // drifting. Use earliest legitimate start time.
         fprintf(stderr, "time paradox: backsliding start by %ld usec\n",
                 (long)tmpdiff);
-        start_rxtime = rxtime - id * USEC_PER_PKT;
+        start_rxtime = rxtime - id * usec_per_pkt;
       }
-      int32_t rxdiff = DIFF(rxtime, start_rxtime + id * USEC_PER_PKT);
+      int32_t rxdiff = DIFF(rxtime, start_rxtime + id * usec_per_pkt);
 
       // Figure out the offset between our clock and the remote's clock, so
       // we can calculate the minimum round trip time (rtt). Then, because
@@ -408,17 +508,42 @@ int main(int argc, char **argv) {
       // determine it more accurately than that.)
       int32_t clockdiff = DIFF(start_rxtime, start_rtxtime);
       int32_t rtt = clockdiff + ntohl(rx.clockdiff);
-      int32_t offset = DIFF(clockdiff, -rtt / 2);
-      lat_rx_count++;
-      lat_rx_sum += rxdiff + rtt/2;
-      long long lat_rx_var = rxdiff + rtt/2 - DIV(lat_rx_sum, lat_rx_count);
-      lat_rx_var_sum += lat_rx_var * lat_rx_var;
-      printf("%16s  %6.1f ms rx  (min=%.1f)  loss: %ld/%ld tx  %ld/%ld rx\n",
-             last_ackinfo,
-             (rxdiff + rtt/2) / 1000.0, (rtt/2) / 1000.0,
-             (long)ntohl(rx.num_lost), (long)next_tx_id - 1,
-             (long)num_lost, (long)next_rx_id - 1);
-      last_ackinfo[0] = '\0';
+      int32_t offset = DIFF(clockdiff, rtt / 2);
+      if (!ntohl(rx.clockdiff)) {
+        // don't print the first packet: it has an invalid clockdiff since
+        // the client can't calculate the clockdiff until it receives
+        // at least one packet from us.
+        last_print = now - usec_per_print + 1;
+      } else {
+        // not the first packet, so statistics are valid.
+        lat_rx_count++;
+        lat_rx = rxdiff + rtt/2;
+        lat_rx_min = lat_rx_min > lat_rx ? lat_rx : lat_rx_min;
+        lat_rx_max = lat_rx_max < lat_rx ? lat_rx : lat_rx_max;
+        lat_rx_sum += lat_rx;
+        lat_rx_var_sum += lat_rx * lat_rx;
+      }
+
+      // Note: the way ok_to_print is structured, if there is a dropout in
+      // the connection for more than usec_per_print, we will statistically
+      // end up printing the first packet after the dropout ends.  That one
+      // should have the longest timeout, ie. a "worst case" packet, which is
+      // usually the information you want to see.
+      int ok_to_print = !quiet && DIFF(now, last_print) >= usec_per_print;
+      if (ok_to_print) {
+        if (want_timestamps) print_timestamp(rxtime);
+        printf("%12s  %6.1f ms rx  (min=%.1f)  loss: %ld/%ld tx  %ld/%ld rx\n",
+               last_ackinfo,
+               (rxdiff + rtt/2) / 1000.0,
+               (rtt/2) / 1000.0,
+               (long)ntohl(rx.num_lost),
+               (long)next_tx_id - 1,
+               (long)num_lost,
+               (long)next_rx_id - 1);
+        last_ackinfo[0] = '\0';
+        last_print = now;
+      }
+
       if (rxdiff < min_cycle_rxdiff) min_cycle_rxdiff = rxdiff;
       if (DIFF(now, next_cycle) >= 0) {
         if (min_cycle_rxdiff > 0) {
@@ -443,21 +568,29 @@ int main(int argc, char **argv) {
         if (!ackid) continue;  // empty slot
         if (DIFF(ackid, next_rxack_id) >= 0) {
           // an expected ack
-          uint32_t start_txtime = next_send - next_tx_id * USEC_PER_PKT;
+          uint32_t start_txtime = next_send - next_tx_id * usec_per_pkt;
+          uint32_t txtime = start_txtime + ackid * usec_per_pkt;
           uint32_t rrxtime = ntohl(rx.acks[acki].rxtime);
+          uint32_t rxtime = rrxtime + offset;
           // note: already contains 1/2 rtt, unlike rxdiff
-          int32_t txdiff = DIFF(rrxtime + offset,
-                                start_txtime + ackid * USEC_PER_PKT);
-          if (last_ackinfo[0]) {
-            printf("%16s\n", last_ackinfo);
+          int32_t txdiff = DIFF(rxtime, txtime);
+          if (usec_per_print <= 0 && last_ackinfo[0]) {
+            // only print multiple acks per rx if no usec_per_print limit
+            if (want_timestamps) print_timestamp(rxtime);
+            printf("%12s\n", last_ackinfo);
+            last_ackinfo[0] = '\0';
           }
-          snprintf(last_ackinfo, sizeof(last_ackinfo), "%6.1f ms tx",
-                   txdiff / 1000.0);
+          if (!last_ackinfo[0]) {
+            snprintf(last_ackinfo, sizeof(last_ackinfo), "%6.1f ms tx",
+                     txdiff / 1000.0);
+          }
           next_rxack_id = ackid + 1;
-          lat_tx_sum += txdiff;
           lat_tx_count++;
-          long long lat_tx_var = txdiff - DIV(lat_tx_sum, lat_tx_count);
-          lat_tx_var_sum += lat_tx_var * lat_tx_var;
+          lat_tx = txdiff;
+          lat_tx_min = lat_tx_min > lat_tx ? lat_tx : lat_tx_min;
+          lat_tx_max = lat_tx_max < lat_tx ? lat_tx : lat_tx_max;
+          lat_tx_sum += lat_tx;
+          lat_tx_var_sum += lat_tx * lat_tx;
         }
       }
 
@@ -465,13 +598,18 @@ int main(int argc, char **argv) {
     }
   }
 
-  printf("\nStats: "
-         "tx: %.2f ms avg, %.2f stddev   "
-         "rx: %.2f ms avg, %.2f stddev\n",
+  printf("\n---\n");
+  printf("tx: min/avg/max/mdev = %.2f/%.2f/%.2f/%.2f ms\n",
+         lat_tx_min / 1000.0,
          DIV(lat_tx_sum, lat_tx_count) / 1000.0,
-         sqrt(DIV(lat_tx_var_sum, lat_tx_count)) / 1000.0,
+         lat_tx_max / 1000.0,
+         onepass_stddev(lat_tx_var_sum, lat_tx_sum, lat_tx_count) / 1000.0);
+  printf("rx: min/avg/max/mdev = %.2f/%.2f/%.2f/%.2f ms\n",
+         lat_rx_min / 1000.0,
          DIV(lat_rx_sum, lat_rx_count) / 1000.0,
-         sqrt(DIV(lat_rx_var_sum, lat_rx_count)) / 1000.0);
+         lat_rx_max / 1000.0,
+         onepass_stddev(lat_rx_var_sum, lat_rx_sum, lat_rx_count) / 1000.0);
+  printf("\n");
 
   if (ai) freeaddrinfo(ai);
   if (sock >= 0) close(sock);
