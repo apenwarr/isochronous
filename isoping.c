@@ -275,6 +275,11 @@ int main(int argc, char **argv) {
   } else {
     usage_and_die(argv[0]);
   }
+  uint32_t ttl = 2;
+  if (setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl))) {
+    perror("setsockopt");
+    return 1;
+  }
 
   int32_t usec_per_pkt = 1e6 / packets_per_sec;
   int32_t usec_per_print = prints_per_sec > 0 ? 1e6 / prints_per_sec : 0;
