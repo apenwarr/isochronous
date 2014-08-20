@@ -309,6 +309,7 @@ int run_client(const char *remotename, long megabits_per_sec) {
                stats.drop_count,
                stats.drop_maxlength / 1e6,
                stats.drop_maxdepth / 1e6);
+        fflush(stdout);
         last_print_time = now;
       }
     }
