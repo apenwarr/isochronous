@@ -142,6 +142,7 @@ static void usage_and_die(char *argv0) {
           "\n"
           "      -f <lines/sec>  max output lines per second\n"
           "      -r <pps>        packets per second (default=%g)\n"
+          "      -t <ttl>        packet ttl to use (default=2 for safety)\n"
           "      -q              quiet mode (don't print packets)\n"
           "      -T              print timestamps\n",
           argv0, argv0, (double)DEFAULT_PACKETS_PER_SEC);
@@ -206,11 +207,11 @@ int main(int argc, char **argv) {
   struct sockaddr *remoteaddr = NULL;
   socklen_t remoteaddr_len = 0, rxaddr_len = 0;
   struct addrinfo *ai = NULL;
-  int sock = -1, want_timestamps = 0, quiet = 0;
+  int sock = -1, want_timestamps = 0, quiet = 0, ttl = 2;
   double packets_per_sec = DEFAULT_PACKETS_PER_SEC, prints_per_sec = -1;
 
   int c;
-  while ((c = getopt(argc, argv, "f:r:qTh?")) >= 0) {
+  while ((c = getopt(argc, argv, "f:r:t:qTh?")) >= 0) {
     switch (c) {
     case 'f':
       prints_per_sec = atof(optarg);
@@ -224,6 +225,13 @@ int main(int argc, char **argv) {
       if (packets_per_sec < 0.001 || packets_per_sec > 1e6) {
         fprintf(stderr, "%s: packets per sec (-r) must be 0.001..1000000\n",
                 argv[0]);
+        return 99;
+      }
+      break;
+    case 't':
+      ttl = atoi(optarg);
+      if (ttl < 1) {
+        fprintf(stderr, "%s: ttl must be >= 1\n", argv[0]);
         return 99;
       }
       break;
@@ -249,11 +257,6 @@ int main(int argc, char **argv) {
 
   if (argc - optind == 0) {
     is_server = 1;
-    sock = socket(PF_INET6, SOCK_DGRAM, 0);
-    if (sock < 0) {
-      perror("socket");
-      return 1;
-    }
     memset(&listenaddr, 0, sizeof(listenaddr));
     listenaddr.sin6_family = AF_INET6;
     listenaddr.sin6_port = htons(SERVER_PORT);
@@ -292,10 +295,23 @@ int main(int argc, char **argv) {
   } else {
     usage_and_die(argv[0]);
   }
-  uint32_t ttl = 2;
-  if (setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl))) {
-    perror("setsockopt");
+
+  fprintf(stderr, "using ttl=%d\n", ttl);
+  // IPPROTO_IPV6 is the only one that works on MacOS, and is arguably the
+  // technically correct thing to do since it's an AF_INET6 socket.
+  if (setsockopt(sock, IPPROTO_IPV6, IP_TTL, &ttl, sizeof(ttl))) {
+    perror("setsockopt(TTLv6)");
     return 1;
+  }
+  // ...but in Linux (at least 3.13), IPPROTO_IPV6 does not actually
+  // set the TTL if the IPv6 socket ends up going over IPv4.  We have to
+  // set that separately.  On MacOS, that always returns EINVAL, so ignore
+  // the error if that happens.
+  if (setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl))) {
+    if (errno != EINVAL) {
+      perror("setsockopt(TTLv4)");
+      return 1;
+    }
   }
 
   int32_t usec_per_pkt = 1e6 / packets_per_sec;
