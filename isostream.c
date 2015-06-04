@@ -101,7 +101,8 @@ static void usage_and_die(char *argv0) {
           "Usage: %s                           (server mode)\n"
           "   or: %s <options...> <server-ip>  (client mode)\n"
           "\n"
-          "      -b <Mbits/sec>  Mbits per second\n",
+          "      -b <Mbits/sec>  Mbits per second\n"
+          "      -P <number>     limit to this many parallel connections\n",
           argv0, argv0);
   exit(99);
 }
@@ -436,15 +437,24 @@ int main(int argc, char **argv) {
   socklen_t remoteaddr_len;
   int sock = -1;
   int megabits_per_sec = 0;
+  int max_children = MAX_CHILDREN;
 
   int c;
-  while ((c = getopt(argc, argv, "b:h?")) >= 0) {
+  while ((c = getopt(argc, argv, "b:P:h?")) >= 0) {
     switch (c) {
     case 'b':
       megabits_per_sec = atoi(optarg);
       if (megabits_per_sec > MAX_MBITS || megabits_per_sec < 1) {
         fprintf(stderr, "%s: megabits per second must be >= 0 and < %d\n",
                 argv[0], MAX_MBITS);
+        return 99;
+      }
+      break;
+    case 'P':
+      max_children = atoi(optarg);
+      if (max_children > MAX_CHILDREN || max_children < 1) {
+        fprintf(stderr, "%s: max connections must be >= 0 and < %d\n",
+                argv[0], MAX_CHILDREN);
         return 99;
       }
       break;
@@ -502,7 +512,7 @@ int main(int argc, char **argv) {
     while (!want_to_die) {
       int nfds;
 
-      if (numchildren < MAX_CHILDREN) {
+      if (numchildren < max_children) {
         nfds = do_select(sock, numchildren ? 1000*1000 : -1);
       } else {
         if (waitpid(-1, NULL, 0) > 0) {
