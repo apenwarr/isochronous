@@ -102,6 +102,7 @@ static void usage_and_die(char *argv0) {
           "   or: %s <options...> <server-ip>  (client mode)\n"
           "\n"
           "      -b <Mbits/sec>  Mbits per second\n"
+          "      -I <interface>  set source interface to specified interface\n"
           "      -P <number>     limit to this many parallel connections\n",
           argv0, argv0);
   exit(99);
@@ -221,7 +222,8 @@ void run_server(int conn, struct sockaddr_in6 *remoteaddr,
 }
 
 
-int run_client(const char *remotename, long megabits_per_sec) {
+int run_client(const char *remotename, const char *ifr_name,
+               long megabits_per_sec) {
   int sock = -1, ret = 1, alive = 0;
   struct addrinfo *ai = NULL;
   struct addrinfo hints = {
@@ -320,6 +322,15 @@ int run_client(const char *remotename, long megabits_per_sec) {
       if (sock < 0) {
         perror("socket");
         goto error;
+      }
+
+      if (ifr_name) {
+        fprintf(stderr, "binding to interface %s\n", ifr_name);
+        if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+                       ifr_name, strlen(ifr_name)) < 0) {
+          perror("setsockopt(SO_BINDTODEVICE)");
+          return 1;
+        }
       }
 
       fprintf(stderr, "connecting to %s...\n", sockaddr_to_str(ai->ai_addr));
@@ -440,7 +451,8 @@ int main(int argc, char **argv) {
   int max_children = MAX_CHILDREN;
 
   int c;
-  while ((c = getopt(argc, argv, "b:P:h?")) >= 0) {
+  char *ifr_name = NULL;
+  while ((c = getopt(argc, argv, "b:I:P:h?")) >= 0) {
     switch (c) {
     case 'b':
       megabits_per_sec = atoi(optarg);
@@ -449,6 +461,9 @@ int main(int argc, char **argv) {
                 argv[0], MAX_MBITS);
         return 99;
       }
+      break;
+    case 'I':
+      ifr_name = optarg;
       break;
     case 'P':
       max_children = atoi(optarg);
@@ -558,7 +573,7 @@ int main(int argc, char **argv) {
     }
 
     const char *remotename = argv[optind];
-    return run_client(remotename, megabits_per_sec);
+    return run_client(remotename, ifr_name, megabits_per_sec);
   } else {
     // wrong number of arguments
     usage_and_die(argv[0]);
