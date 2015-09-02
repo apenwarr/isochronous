@@ -52,6 +52,10 @@
 #define _STR(n) #n
 #define STR(n) _STR(n)
 
+const struct timespec second = {
+  .tv_sec = 1,
+  .tv_nsec = 0,
+};
 
 struct Request {
   uint32_t magic;     // magic number to reject bogus packets or wrong version
@@ -98,12 +102,15 @@ static long long monotime(void) {
 static void usage_and_die(char *argv0) {
   fprintf(stderr,
           "\n"
-          "Usage: %s                           (server mode)\n"
+          "Usage: %s <options...>              (server mode)\n"
           "   or: %s <options...> <server-ip>  (client mode)\n"
           "\n"
+          "Server specific:\n"
+          "      -P <number>     limit to this many parallel connections\n"
+          "Client specific:\n"
           "      -b <Mbits/sec>  Mbits per second\n"
           "      -I <interface>  set source interface to specified interface\n"
-          "      -P <number>     limit to this many parallel connections\n",
+          "      -t <number>     time in seconds to run for\n",
           argv0, argv0);
   exit(99);
 }
@@ -206,7 +213,18 @@ void run_server(int conn, struct sockaddr_in6 *remoteaddr,
     long long goal = (now - start) * megabits_per_sec / 8;
     long long to_write = goal - total;
     if (to_write < bytes_per_period) {
-      usleep((bytes_per_period - to_write) * 8 / megabits_per_sec);
+      long long delay_nsec = (bytes_per_period - to_write) * 8 * 1000 / megabits_per_sec;
+      struct timespec tx_delay = {
+        .tv_sec = delay_nsec / 1000000000LL,
+        .tv_nsec = delay_nsec % 1000000000LL,
+      };
+      if (tx_delay.tv_sec) {
+        fprintf(stderr, "Warning: client sleeping longer than 1 second.\n");
+      }
+      if (nanosleep(&tx_delay, NULL)) {
+        perror("nanosleep");
+        break;
+      }
       continue;
     }
     if (to_write > (int)sizeof(buf)) {
@@ -431,7 +449,11 @@ reopen:
       alive = 0;
     }
     fprintf(stderr, "retrying connection...\n");
-    sleep(1);
+
+    if (nanosleep(&second, NULL)) {
+      perror("nanosleep");
+      want_to_die = 1;
+    }
     close(sock);
     sock = -1;
   }
@@ -448,11 +470,12 @@ int main(int argc, char **argv) {
   socklen_t remoteaddr_len;
   int sock = -1;
   int megabits_per_sec = 0;
+  int timeout = 0;
   int max_children = MAX_CHILDREN;
 
   int c;
   char *ifr_name = NULL;
-  while ((c = getopt(argc, argv, "b:I:P:h?")) >= 0) {
+  while ((c = getopt(argc, argv, "b:I:P:t:h?")) >= 0) {
     switch (c) {
     case 'b':
       megabits_per_sec = atoi(optarg);
@@ -473,6 +496,14 @@ int main(int argc, char **argv) {
         return 99;
       }
       break;
+    case 't':
+      timeout = atoi(optarg);
+      if (timeout < 0) {
+        fprintf(stderr, "%s: timeout must be an integer >= 0, not '%s'\n",
+                argv[0], optarg);
+        return 99;
+      }
+      break;
     case 'h':
     case '?':
     default:
@@ -486,6 +517,7 @@ int main(int argc, char **argv) {
     .sa_flags = SA_RESETHAND,
   };
   sigaction(SIGINT, &act, NULL);
+  sigaction(SIGALRM, &act, NULL);
   signal(SIGPIPE, SIG_IGN);
 
   if (argc - optind == 0) {
@@ -549,7 +581,10 @@ int main(int argc, char **argv) {
         pid_t pid = fork();
         if (pid < 0) {
           perror("fork");
-          sleep(1);
+          if (nanosleep(&second, NULL)) {
+            perror("nanosleep");
+            exit(99);
+          }
           close(conn);
         } else if (pid > 0) {
           // parent
@@ -570,6 +605,9 @@ int main(int argc, char **argv) {
     if (!megabits_per_sec) {
       fprintf(stderr, "%s: must specify -b in client mode\n", argv[0]);
       usage_and_die(argv[0]);
+    }
+    if (timeout > 0) {
+      alarm(timeout);
     }
 
     const char *remotename = argv[optind];
