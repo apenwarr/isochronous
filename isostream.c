@@ -110,7 +110,8 @@ static void usage_and_die(char *argv0) {
           "Client specific:\n"
           "      -b <Mbits/sec>  Mbits per second\n"
           "      -I <interface>  set source interface to specified interface\n"
-          "      -t <number>     time in seconds to run for\n",
+          "      -s <number>     consider test sufficient after <number> seconds connected\n"
+          "      -t <number>     maximum time in seconds to run for\n",
           argv0, argv0);
   exit(99);
 }
@@ -241,7 +242,7 @@ void run_server(int conn, struct sockaddr_in6 *remoteaddr,
 
 
 int run_client(const char *remotename, const char *ifr_name,
-               long megabits_per_sec) {
+               long megabits_per_sec, double sufficient) {
   int sock = -1, ret = 1, alive = 0;
   struct addrinfo *ai = NULL;
   struct addrinfo hints = {
@@ -250,6 +251,7 @@ int run_client(const char *remotename, const char *ifr_name,
     .ai_socktype = SOCK_STREAM,
   };
   int err = getaddrinfo(remotename, STR(SERVER_PORT), &hints, &ai);
+  double elapsed = 0;
   if (err != 0 || !ai) {
     fprintf(stderr, "getaddrinfo(%s): %s\n", remotename, gai_strerror(err));
     return 1;
@@ -270,6 +272,10 @@ int run_client(const char *remotename, const char *ifr_name,
   while (!want_to_die) {
     now = monotime();
     if (start_time) {
+      elapsed = (now - start_time) / 1e6;
+      if (sufficient && elapsed > sufficient) {
+        want_to_die = 1;
+      }
       long long expected_bytes = megabits_per_sec * (now - start_time) / 8;
       long long offset = total - expected_bytes;
       usec_offset = offset * 8 / megabits_per_sec;
@@ -321,7 +327,7 @@ int run_client(const char *remotename, const char *ifr_name,
       if (now - last_print_time >= 1000000) {
         printf("%11.3fs %ldMbps offset=%.3fs disconn=%lld/%.3fs "
                "drops=%lld/%.3fs/%.3fs\n",
-               (now - start_time) / 1e6,
+               elapsed,
                megabits_per_sec,
                (usec_offset + stats.disconnect_usecs) / 1e6,
                stats.disconnect_count,
@@ -443,6 +449,10 @@ int run_client(const char *remotename, const char *ifr_name,
 
     continue;
 reopen:
+    // TODO(willangley): implement exponential backoff during reopen
+    //   this may be required if disconnections are common on real
+    //   wireless networks, in order to give the isostream that was last
+    //   connected a greater likelihood of reconnecting.
     if (alive) {
       stop_time = now;
       stats.disconnect_count++;
@@ -470,17 +480,18 @@ int main(int argc, char **argv) {
   socklen_t remoteaddr_len;
   int sock = -1;
   int megabits_per_sec = 0;
+  double sufficient = 0;
   int timeout = 0;
   int max_children = MAX_CHILDREN;
 
   int c;
   char *ifr_name = NULL;
-  while ((c = getopt(argc, argv, "b:I:P:t:h?")) >= 0) {
+  while ((c = getopt(argc, argv, "b:I:P:s:t:h?")) >= 0) {
     switch (c) {
     case 'b':
       megabits_per_sec = atoi(optarg);
       if (megabits_per_sec > MAX_MBITS || megabits_per_sec < 1) {
-        fprintf(stderr, "%s: megabits per second must be >= 0 and < %d\n",
+        fprintf(stderr, "%s: megabits per second must be > 0 and < %d\n",
                 argv[0], MAX_MBITS);
         return 99;
       }
@@ -493,6 +504,13 @@ int main(int argc, char **argv) {
       if (max_children > MAX_CHILDREN || max_children < 1) {
         fprintf(stderr, "%s: max connections must be >= 0 and < %d\n",
                 argv[0], MAX_CHILDREN);
+        return 99;
+      }
+      break;
+    case 's':
+      sufficient = atof(optarg);
+      if (sufficient < 1) {
+        fprintf(stderr, "%s: sufficient time must be >= 1\n", argv[0]);
         return 99;
       }
       break;
@@ -611,7 +629,7 @@ int main(int argc, char **argv) {
     }
 
     const char *remotename = argv[optind];
-    return run_client(remotename, ifr_name, megabits_per_sec);
+    return run_client(remotename, ifr_name, megabits_per_sec, sufficient);
   } else {
     // wrong number of arguments
     usage_and_die(argv[0]);
