@@ -266,7 +266,8 @@ int run_client(const char *remotename, const char *ifr_name,
   } stats;
   memset(&stats, 0, sizeof(stats));
 
-  long long start_time = 0, stop_time = 0, last_print_time = 0, now = 0;
+  long long prestart_time = 0, start_time = 0, stop_time = 0;
+  long long last_wait_time = 0, last_print_time = 0, now = 0;
   long long drop_start_time = 0, drop_depth = 0;
   long long total = 0, usec_offset = 0, last_usec_offset = 0;
   while (!want_to_die) {
@@ -391,9 +392,13 @@ int run_client(const char *remotename, const char *ifr_name,
       goto reopen;
     }
 
+    now = monotime();
+    if (!prestart_time) {
+      prestart_time = now;
+    }
+
     if (nfds > 0) {
       ssize_t len = read(sock, buf, sizeof(buf));
-      now = monotime();
 
       /*
        * This is the subtle part:
@@ -446,13 +451,23 @@ int run_client(const char *remotename, const char *ifr_name,
         total += len;
       }
     }
+    else {
+      last_wait_time = now;
+      if (!start_time && (last_wait_time - prestart_time > 10 * 1000000LL)) {
+        /* We weren't actually alive after all, so ignore in stats.. */
+        alive = 0;
+        goto reopen;
+      }
+    }
 
     continue;
 reopen:
-    // TODO(willangley): implement exponential backoff during reopen
-    //   this may be required if disconnections are common on real
-    //   wireless networks, in order to give the isostream that was last
-    //   connected a greater likelihood of reconnecting.
+    /*
+     * TODO(willangley): implement exponential backoff during reopen
+     *   this may be required if disconnections are common on real
+     *   wireless networks, in order to give the isostream that was last
+     *   connected a greater likelihood of reconnecting.
+     */
     if (alive) {
       stop_time = now;
       stats.disconnect_count++;
@@ -465,6 +480,7 @@ reopen:
       want_to_die = 1;
     }
     close(sock);
+    prestart_time = 0;
     sock = -1;
   }
 
