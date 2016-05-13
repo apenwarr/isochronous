@@ -107,6 +107,7 @@ static void usage_and_die(char *argv0) {
           "\n"
           "Server specific:\n"
           "      -P <number>     limit to this many parallel connections\n"
+          "      -C <algo>       override TCP congestion control algorithm\n"
           "Client specific:\n"
           "      -b <Mbits/sec>  Mbits per second\n"
           "      -I <interface>  set source interface to specified interface\n"
@@ -145,6 +146,24 @@ static const char *sockaddr_to_str(struct sockaddr *sa) {
   int addrlen = strlen(addrbuf);
   snprintf(addrbuf + addrlen, sizeof(addrbuf) - addrlen, "]:%d", port);
   return addrbuf;
+}
+
+
+int set_cong_ctl(int sock, const char *cong_ctl) {
+#ifdef TCP_CONGESTION
+  if (setsockopt(sock, IPPROTO_TCP, TCP_CONGESTION,
+                 cong_ctl, strlen(cong_ctl)) != 0) {
+    char buf[128];
+    int e = errno;
+    snprintf(buf, sizeof(buf), "tcp_congestion('%s')", cong_ctl);
+    errno = e;
+    perror(buf);
+    return -1;
+  } else {
+    fprintf(stderr, "tcp_congestion set to '%s'.\n", cong_ctl);
+  }
+#endif
+  return 0;
 }
 
 
@@ -499,10 +518,11 @@ int main(int argc, char **argv) {
   double sufficient = 0;
   int timeout = 0;
   int max_children = MAX_CHILDREN;
+  const char *cong_ctl = NULL;
 
   int c;
   char *ifr_name = NULL;
-  while ((c = getopt(argc, argv, "b:I:P:s:t:h?")) >= 0) {
+  while ((c = getopt(argc, argv, "b:I:P:C:s:t:h?")) >= 0) {
     switch (c) {
     case 'b':
       megabits_per_sec = atoi(optarg);
@@ -522,6 +542,14 @@ int main(int argc, char **argv) {
                 argv[0], MAX_CHILDREN);
         return 99;
       }
+      break;
+    case 'C':
+      cong_ctl = optarg;
+#ifndef TCP_CONGESTION
+      fprintf(stderr, "%s: no support for congestion control overrides.\n",
+              argv[0]);
+      return 99;
+#endif
       break;
     case 's':
       sufficient = atof(optarg);
@@ -582,6 +610,9 @@ int main(int argc, char **argv) {
       perror("getsockname");
       return 1;
     }
+    if (cong_ctl && set_cong_ctl(sock, cong_ctl) != 0) {
+      return 1;
+    }
     if (listen(sock, 1)) {
       perror("listen");
       return 1;
@@ -612,6 +643,9 @@ int main(int argc, char **argv) {
           perror("accept");
           continue;
         }
+        if (cong_ctl && set_cong_ctl(conn, cong_ctl) != 0) {
+          return 1;
+        }
         pid_t pid = fork();
         if (pid < 0) {
           perror("fork");
@@ -635,6 +669,11 @@ int main(int argc, char **argv) {
     }
   } else if (argc - optind == 1) {
     fprintf(stderr, "client mode.\n");
+    if (cong_ctl) {
+      fprintf(stderr, "%s: can't set congestion control in client mode.\n",
+              argv[0]);
+      usage_and_die(argv[0]);
+    }
 
     if (!megabits_per_sec) {
       fprintf(stderr, "%s: must specify -b in client mode\n", argv[0]);
