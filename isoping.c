@@ -210,6 +210,8 @@ int main(int argc, char **argv) {
   int sock = -1, want_timestamps = 0, quiet = 0, ttl = 2;
   double packets_per_sec = DEFAULT_PACKETS_PER_SEC, prints_per_sec = -1;
 
+  setvbuf(stdout, NULL, _IOLBF, 0);
+
   int c;
   while ((c = getopt(argc, argv, "f:r:t:qTh?")) >= 0) {
     switch (c) {
