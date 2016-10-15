@@ -84,6 +84,8 @@ static void sighandler(int sig) {
 Session::Session(uint32_t now)
     : usec_per_pkt(1e6 / packets_per_sec),
       usec_per_print(prints_per_sec > 0 ? 1e6 / prints_per_sec : 0),
+      remoteaddr(NULL),
+      remoteaddr_len(0),
       next_tx_id(1),
       next_rx_id(0),
       next_rxack_id(0),
@@ -225,17 +227,15 @@ void prepare_tx_packet(struct Session *s) {
   s->tx.first_ack = htonl(s->next_txack_index);
 }
 
-static int send_packet(struct Session *s,
-                       int sock,
-                       struct sockaddr *remoteaddr,
-                       socklen_t remoteaddr_len) {
+
+static int send_packet(struct Session *s, int sock) {
   // note: tx.acks[] is filled in incrementally; we just transmit the current
   // state of it here.  The reason we keep a list of the most recent acks is in
   // case our packet gets lost, so the receiver will have more chances to
   // receive the timing information for the packets it sent us.
   if (is_server) {
     if (sendto(sock, &s->tx, sizeof(s->tx), 0,
-               remoteaddr, remoteaddr_len) < 0) {
+               s->remoteaddr, s->remoteaddr_len) < 0) {
       perror("sendto");
     }
   } else {
@@ -246,6 +246,63 @@ static int send_packet(struct Session *s,
     }
   }
   s->next_send += s->usec_per_pkt;
+  return 0;
+}
+
+
+int maybe_send_packet(struct Session *s, int sock, uint32_t now) {
+  if (s->remoteaddr && DIFF(now, s->next_send) >= 0) {
+    prepare_tx_packet(s);
+    int err = send_packet(s, sock);
+    if (err != 0) {
+      return err;
+    }
+  }
+  return 0;
+}
+
+
+int read_incoming_packet(struct Session *s, int sock, uint32_t now) {
+  struct sockaddr_in6 rxaddr;
+  socklen_t rxaddr_len = 0;
+  // TODO(pmccurdy): Temporary until we properly support multiple clients.
+  static struct sockaddr_in6 last_rxaddr;
+
+  rxaddr_len = sizeof(rxaddr);
+  ssize_t got = recvfrom(sock, &s->rx, sizeof(s->rx), 0,
+                         (struct sockaddr *)&rxaddr, &rxaddr_len);
+  if (got < 0) {
+    int e = errno;
+    perror("recvfrom");
+    return e;
+  }
+  if (got != sizeof(s->rx) || s->rx.magic != htonl(MAGIC)) {
+    fprintf(stderr, "got invalid packet of length %ld\n", (long)got);
+    return EINVAL;
+  }
+
+  // is it a new client?
+  if (is_server) {
+    // TODO(pmccurdy): Maintain a hash table of Sessions, look up based
+    // on rxaddr, create a new one if necessary, remove this resetting code.
+    if (!s->remoteaddr ||
+        memcmp(&rxaddr, &last_rxaddr, sizeof(rxaddr)) != 0) {
+      fprintf(stderr, "new client connected: %s\n",
+              sockaddr_to_str((struct sockaddr *)&rxaddr));
+      memcpy(&last_rxaddr, &rxaddr, sizeof(rxaddr));
+      s->remoteaddr = (struct sockaddr *)&last_rxaddr;
+      s->remoteaddr_len = rxaddr_len;
+
+      s->next_send = now + 10*1000;
+      s->next_tx_id = 1;
+      s->next_rx_id = s->next_rxack_id = 0;
+      s->start_rtxtime = s->start_rxtime = 0;
+      s->num_lost = 0;
+      s->next_txack_index = 0;
+      s->usec_per_pkt = ntohl(s->rx.usec_per_pkt);
+      memset(&s->tx, 0, sizeof(s->tx));
+    }
+  }
   return 0;
 }
 
@@ -441,9 +498,7 @@ void handle_packet(struct Session *s, uint32_t now) {
 
 
 int isoping_main(int argc, char **argv) {
-  struct sockaddr_in6 listenaddr, rxaddr, last_rxaddr;
-  struct sockaddr *remoteaddr = NULL;
-  socklen_t remoteaddr_len = 0, rxaddr_len = 0;
+  struct sockaddr_in6 listenaddr;
   struct addrinfo *ai = NULL;
   int sock = -1;
 
@@ -494,6 +549,10 @@ int isoping_main(int argc, char **argv) {
     return 1;
   }
 
+  uint32_t now = ustime();       // current time
+
+  struct Session s(now);
+
   if (argc - optind == 0) {
     is_server = 1;
     memset(&listenaddr, 0, sizeof(listenaddr));
@@ -529,8 +588,8 @@ int isoping_main(int argc, char **argv) {
       perror("connect");
       return 1;
     }
-    remoteaddr = ai->ai_addr;
-    remoteaddr_len = ai->ai_addrlen;
+    s.remoteaddr = ai->ai_addr;
+    s.remoteaddr_len = ai->ai_addrlen;
   } else {
     usage_and_die(argv[0]);
   }
@@ -553,15 +612,11 @@ int isoping_main(int argc, char **argv) {
     }
   }
 
-  uint32_t now = ustime();       // current time
-
   struct sigaction act;
   memset(&act, 0, sizeof(act));
   act.sa_handler = sighandler;
   act.sa_flags = SA_RESETHAND;
   sigaction(SIGINT, &act, NULL);
-
-  struct Session s(now);
 
   while (!want_to_die) {
     fd_set rfds;
@@ -576,7 +631,7 @@ int isoping_main(int argc, char **argv) {
     } else {
       tv.tv_usec = DIFF(s.next_send, now);
     }
-    int nfds = select(sock + 1, &rfds, NULL, NULL, remoteaddr ? &tv : NULL);
+    int nfds = select(sock + 1, &rfds, NULL, NULL, s.remoteaddr ? &tv : NULL);
     now = ustime();
     if (nfds < 0 && errno != EINTR) {
       perror("select");
@@ -584,59 +639,23 @@ int isoping_main(int argc, char **argv) {
     }
 
     // time to send the next packet?
-    if (remoteaddr && DIFF(now, s.next_send) >= 0) {
-      prepare_tx_packet(&s);
-      int err = send_packet(&s, sock, remoteaddr, remoteaddr_len);
-      if (err != 0) {
-        return err;
-      }
-      // TODO(pmccurdy): Track disconnections across multiple clients.  Use
-      // recvmsg with the MSG_ERRQUEUE flag to detect connection refused.
-      if (is_server && DIFF(now, s.last_rxtime) > 60*1000*1000) {
-        fprintf(stderr, "client disconnected.\n");
-        remoteaddr = NULL;
-      }
+    int err = maybe_send_packet(&s, sock, now);
+    if (err != 0) {
+      return err;
+    }
+    // TODO(pmccurdy): Track disconnections across multiple clients.  Use
+    // recvmsg with the MSG_ERRQUEUE flag to detect connection refused.
+    if (is_server && DIFF(now, s.last_rxtime) > 60 * 1000 * 1000) {
+      fprintf(stderr, "client disconnected.\n");
+      s.remoteaddr = NULL;
     }
 
     if (nfds > 0) {
-      // incoming packet
-      rxaddr_len = sizeof(rxaddr);
-      ssize_t got = recvfrom(sock, &s.rx, sizeof(s.rx), 0,
-                             (struct sockaddr *)&rxaddr, &rxaddr_len);
-      if (got < 0) {
-        int e = errno;
-        perror("recvfrom");
-        if (!is_server && e == ECONNREFUSED) return 2;
+      err = read_incoming_packet(&s, sock, now);
+      if (!is_server && err == ECONNREFUSED) return 2;
+      if (err != 0) {
         continue;
       }
-      if (got != sizeof(s.rx) || s.rx.magic != htonl(MAGIC)) {
-        fprintf(stderr, "got invalid packet of length %ld\n", (long)got);
-        continue;
-      }
-
-      // is it a new client?
-      if (is_server) {
-        // TODO(pmccurdy): Maintain a hash table of Sessions, look up based
-        // on rxaddr, create a new one if necessary, remove this resetting code.
-        if (!remoteaddr ||
-            memcmp(&rxaddr, &last_rxaddr, sizeof(rxaddr)) != 0) {
-          fprintf(stderr, "new client connected: %s\n",
-                  sockaddr_to_str((struct sockaddr *)&rxaddr));
-          memcpy(&last_rxaddr, &rxaddr, sizeof(rxaddr));
-          remoteaddr = (struct sockaddr *)&last_rxaddr;
-          remoteaddr_len = rxaddr_len;
-
-          s.next_send = now + 10*1000;
-          s.next_tx_id = 1;
-          s.next_rx_id = s.next_rxack_id = 0;
-          s.start_rtxtime = s.start_rxtime = 0;
-          s.num_lost = 0;
-          s.next_txack_index = 0;
-          s.usec_per_pkt = ntohl(s.rx.usec_per_pkt);
-          memset(&s.tx, 0, sizeof(s.tx));
-        }
-      }
-
       handle_packet(&s, now);
     }
   }

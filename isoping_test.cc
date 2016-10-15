@@ -16,8 +16,12 @@
 
 #include <arpa/inet.h>
 #include <limits.h>
+#include <memory.h>
 #include <stdio.h>
-
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
 #include <wvtest.h>
 
 #include "isoping.h"
@@ -414,7 +418,161 @@ WVTEST_MAIN("isoping clock drift") {
   WVPASSEQ(c.lat_rx, half_rtt + drift_per_round / 2);
   WVPASSEQ(c.lat_tx, half_rtt + total_drift / 2 + 1);
   WVPASSEQ(c.min_cycle_rxdiff, INT_MAX);
+}
 
-  t = send_next_packet(&c, cbase, &s, sbase, cs_latency + total_drift);
+WVTEST_MAIN("Send and receive on sockets") {
+  uint32_t cbase = 1400 * 1000;
+  uint32_t sbase = 1600 * 1000;
 
+  // The states of the client and server.
+  struct Session c(cbase);
+  struct Session s(sbase);
+
+  // Sockets for the client and server.
+  int ssock, csock;
+  struct addrinfo hints, *res;
+
+  // Get local interface information.
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET6;
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_flags = AI_PASSIVE | AI_V4MAPPED;
+  int err = getaddrinfo(NULL, "0", &hints, &res);
+  if (err != 0) {
+    WVPASSEQ("Error from getaddrinfo: ", gai_strerror(err));
+    return;
+  }
+
+  ssock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (!WVPASS(ssock >= 0)) {
+    perror("server socket");
+    return;
+  }
+
+  csock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (!WVPASS(csock >= 0)) {
+    perror("client socket");
+    return;
+  }
+
+  if (!WVPASS(!bind(ssock, res->ai_addr, res->ai_addrlen))) {
+    perror("bind");
+    return;
+  }
+
+  // Figure out the local port we got.
+  struct sockaddr_in6 listenaddr;
+  socklen_t listenaddr_len = sizeof(listenaddr);
+  memset(&listenaddr, 0, listenaddr_len);
+  if (!WVPASS(!getsockname(ssock, (struct sockaddr *)&listenaddr,
+                           &listenaddr_len))) {
+    perror("getsockname");
+    return;
+  }
+
+  printf("Bound server socket to port=%d\n", listenaddr.sin6_port);
+
+  // Connect the client's socket.
+  if (!WVPASS(
+          !connect(csock, (struct sockaddr *)&listenaddr, listenaddr_len))) {
+    perror("connect");
+    return;
+  }
+
+  c.remoteaddr = (struct sockaddr *)&listenaddr;
+  c.remoteaddr_len = listenaddr_len;
+
+  uint32_t cs_latency = 4000;
+  uint32_t sc_latency = 5000;
+  uint32_t t = c.usec_per_pkt - 1;
+  WVPASS(!maybe_send_packet(&c, csock, cbase + t));
+
+  // Verify we didn't send a packet before its time.
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(ssock, &rfds);
+  struct timeval tv = {0, 0};
+  int nfds = select(ssock + 1, &rfds, NULL, NULL, &tv);
+  WVPASSEQ(nfds, 0);
+
+  // Send a packet in each direction.
+  t += 1;
+  WVPASS(!maybe_send_packet(&c, csock, cbase + t));
+  WVPASSEQ(c.next_tx_id, 2);
+
+  FD_ZERO(&rfds);
+  FD_SET(ssock, &rfds);
+  nfds = select(ssock + 1, &rfds, NULL, NULL, &tv);
+  WVPASSEQ(nfds, 1);
+
+  t += cs_latency;
+  WVPASS(!read_incoming_packet(&s, ssock, sbase + t));
+
+  WVPASS(s.remoteaddr != NULL);
+  WVPASS(s.remoteaddr_len > 0);
+  WVPASSEQ(s.next_tx_id, 1);
+
+  handle_packet(&s, sbase + t);
+
+  t = s.next_send - sbase;
+  WVPASS(!maybe_send_packet(&s, ssock, sbase + t));
+  WVPASSEQ(s.next_send, sbase + t + s.usec_per_pkt);
+  WVPASSEQ(s.next_tx_id, 2);
+
+  t += sc_latency;
+  WVPASS(!read_incoming_packet(&c, csock, cbase + t));
+  handle_packet(&c, cbase + t);
+  WVPASSEQ(c.lat_rx_count, 1);
+
+  // Verify we reject garbage data.
+  Packet p;
+  p.magic = 0;
+  if (!WVPASSEQ(send(csock, &p, sizeof(p), 0), sizeof(p))) {
+    perror("sendto");
+    return;
+  }
+
+  WVPASSEQ(read_incoming_packet(&s, ssock, sbase + t), EINVAL);
+
+  // Make a new client, getting a new source port.
+  struct Session c2(cbase);
+  c2.usec_per_pkt *= 2;
+  c2.remoteaddr = c.remoteaddr;
+  c2.remoteaddr_len = c.remoteaddr_len;
+  int c2sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (!WVPASS(c2sock > 0)) {
+    perror("client socket 2");
+    return;
+  }
+  if (!WVPASS(!connect(c2sock, c.remoteaddr, c.remoteaddr_len))) {
+    perror("connect");
+    return;
+  }
+  struct sockaddr_in6 c2addr;
+  socklen_t c2addr_len = sizeof(c2addr);
+  memset(&c2addr, 0, c2addr_len);
+  if (!WVPASS(!getsockname(c2sock, (struct sockaddr *)&c2addr, &c2addr_len))) {
+    perror("getsockname");
+    return;
+  }
+
+  t = c2.next_send - cbase;
+  WVPASS(!maybe_send_packet(&c2, c2sock, cbase + t));
+
+  t += cs_latency;
+
+  // Check that a new client resets some state.
+  WVPASS(!read_incoming_packet(&s, ssock, sbase + t));
+
+  WVPASSEQ(ntohs(((sockaddr_in6 *)s.remoteaddr)->sin6_port),
+           ntohs(c2addr.sin6_port));
+  WVPASSEQ(s.next_tx_id, 1);
+  WVPASSEQ(s.next_rx_id, 0);
+  WVPASSEQ(s.usec_per_pkt, c2.usec_per_pkt);
+
+  // Cleanup
+  close(ssock);
+  close(csock);
+  close(c2sock);
+  freeaddrinfo(res);
 }

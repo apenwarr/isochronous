@@ -17,6 +17,7 @@
 #define ISOPING_H
 
 #include <stdint.h>
+#include <sys/socket.h>
 
 // Layout of the UDP packets exchanged between client and server.
 // All integers are in network byte order.
@@ -42,6 +43,10 @@ struct Session {
   Session(uint32_t now);
   int32_t usec_per_pkt;
   int32_t usec_per_print;
+
+  // The peer's address.
+  struct sockaddr *remoteaddr;
+  socklen_t remoteaddr_len;
 
   // WARNING: lots of math below relies on well-defined uint32/int32
   // arithmetic overflow behaviour, plus the fact that when we subtract
@@ -75,6 +80,13 @@ void handle_packet(struct Session *s, uint32_t now);
 
 // Sets all the elements of s->tx to be ready to be sent to the other side.
 void prepare_tx_packet(struct Session *s);
+
+// Sends a packet to the socket if the appropriate amount of time has passed.
+int maybe_send_packet(struct Session *s, int sock, uint32_t now);
+
+// Reads a packet from sock and stores it in s->rx.  Assumes a packet is
+// currently readable.
+int read_incoming_packet(struct Session *s, int sock, uint32_t now);
 
 // Parses arguments and runs the main loop.  Distinct from main() for unit test
 // purposes.
