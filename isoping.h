@@ -16,6 +16,9 @@
 #ifndef ISOPING_H
 #define ISOPING_H
 
+#include <map>
+#include <netinet/in.h>
+#include <queue>
 #include <stdint.h>
 #include <sys/socket.h>
 
@@ -40,12 +43,13 @@ struct Packet {
 
 // Data we track per session.
 struct Session {
-  Session(uint32_t now);
+  Session(uint32_t first_send, uint32_t usec_per_pkt,
+          const struct sockaddr_storage &remoteaddr, size_t remoteaddr_len);
   int32_t usec_per_pkt;
   int32_t usec_per_print;
 
   // The peer's address.
-  struct sockaddr *remoteaddr;
+  struct sockaddr_storage remoteaddr;
   socklen_t remoteaddr_len;
 
   // WARNING: lots of math below relies on well-defined uint32/int32
@@ -75,18 +79,60 @@ struct Session {
       lat_rx_count, lat_rx_sum, lat_rx_var_sum;
 };
 
+// Comparator for use with sockaddr_in and sockaddr_in6 values.  Sorts by
+// address family first, then on the IPv4/6 address, then the port number.
+struct CompareSockaddr {
+  bool operator()(const struct sockaddr_storage &lhs,
+                  const struct sockaddr_storage &rhs);
+};
+
+typedef std::map<struct sockaddr_storage, Session, CompareSockaddr>
+    SessionMap;
+
+// Compares the next_send values of each referenced Session, sorting the earlier
+// timestamps first.
+struct CompareNextSend {
+  bool operator()(const SessionMap::iterator &lhs,
+                  const SessionMap::iterator &rhs);
+};
+
+struct Sessions {
+ public:
+  Sessions() {}
+
+  // All active sessions, indexed by remote address/port.
+  SessionMap session_map;
+  // A queue of upcoming send times, ordered most recent first, referencing
+  // entries in the session map.
+  std::priority_queue<SessionMap::iterator, std::vector<SessionMap::iterator>,
+      CompareNextSend> next_sends;
+
+  SessionMap::iterator NewSession(uint32_t first_send,
+                                  uint32_t usec_per_pkt,
+                                  struct sockaddr_storage *addr,
+                                  socklen_t addr_len);
+
+  uint32_t next_send_time() {
+    if (next_sends.size() == 0) {
+      return 0;
+    }
+    return next_sends.top()->second.next_send;
+  }
+};
+
 // Process the Session's incoming packet, from s->rx.
 void handle_packet(struct Session *s, uint32_t now);
 
 // Sets all the elements of s->tx to be ready to be sent to the other side.
 void prepare_tx_packet(struct Session *s);
 
-// Sends a packet to the socket if the appropriate amount of time has passed.
-int maybe_send_packet(struct Session *s, int sock, uint32_t now);
+// Sends a packet to all waiting sessions where the appropriate amount of time
+// has passed.
+int send_waiting_packets(Sessions *s, int sock, uint32_t now);
 
 // Reads a packet from sock and stores it in s->rx.  Assumes a packet is
 // currently readable.
-int read_incoming_packet(struct Session *s, int sock, uint32_t now);
+int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server);
 
 // Parses arguments and runs the main loop.  Distinct from main() for unit test
 // purposes.

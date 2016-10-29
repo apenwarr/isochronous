@@ -81,11 +81,11 @@ static void sighandler(int sig) {
   want_to_die = 1;
 }
 
-Session::Session(uint32_t now)
-    : usec_per_pkt(1e6 / packets_per_sec),
+Session::Session(uint32_t first_send, uint32_t usec_per_pkt,
+                 const struct sockaddr_storage &raddr, size_t raddr_len)
+    : usec_per_pkt(usec_per_pkt),
       usec_per_print(prints_per_sec > 0 ? 1e6 / prints_per_sec : 0),
-      remoteaddr(NULL),
-      remoteaddr_len(0),
+      remoteaddr_len(raddr_len),
       next_tx_id(1),
       next_rx_id(0),
       next_rxack_id(0),
@@ -94,16 +94,27 @@ Session::Session(uint32_t now)
       last_rxtime(0),
       min_cycle_rxdiff(0),
       next_cycle(0),
-      next_send(now + usec_per_pkt),
+      next_send(first_send),
       num_lost(0),
       next_txack_index(0),
-      last_print(now - usec_per_pkt),
+      last_print(first_send - usec_per_pkt),
       lat_tx(0), lat_tx_min(0x7fffffff), lat_tx_max(0),
       lat_tx_count(0), lat_tx_sum(0), lat_tx_var_sum(0),
       lat_rx(0), lat_rx_min(0x7fffffff), lat_rx_max(0),
       lat_rx_count(0), lat_rx_sum(0), lat_rx_var_sum(0) {
+  memcpy(&remoteaddr, &raddr, raddr_len);
   memset(&tx, 0, sizeof(tx));
   strcpy(last_ackinfo, "");
+}
+
+SessionMap::iterator Sessions::NewSession(uint32_t first_send,
+                                          uint32_t usec_per_pkt,
+                                          struct sockaddr_storage *addr,
+                                          socklen_t addr_len) {
+  std::pair<SessionMap::iterator, bool> p = session_map.insert(std::make_pair(
+      *addr, Session(first_send, usec_per_pkt, *addr, addr_len)));
+  next_sends.push(p.first);
+  return p.first;
 }
 
 // Returns the kernel monotonic timestamp in microseconds, truncated to
@@ -189,6 +200,34 @@ static const char *sockaddr_to_str(struct sockaddr *sa) {
   return addrbuf;
 }
 
+bool CompareSockaddr::operator()(const struct sockaddr_storage &lhs,
+                                 const struct sockaddr_storage &rhs) {
+  if (lhs.ss_family != rhs.ss_family) {
+    return lhs.ss_family < rhs.ss_family;
+  }
+  if (lhs.ss_family == AF_INET) {
+    const struct sockaddr_in &lhs4 = *(const struct sockaddr_in*)&lhs;
+    const struct sockaddr_in &rhs4 = *(const struct sockaddr_in*)&rhs;
+    long long c = (ntohl(lhs4.sin_addr.s_addr) - ntohl(rhs4.sin_addr.s_addr));
+    if (c == 0) {
+      return ntohs(lhs4.sin_port) < ntohs(rhs4.sin_port);
+    }
+    return c < 0;
+  } else {
+    const struct sockaddr_in6 &lhs6 = *(const struct sockaddr_in6*)&lhs;
+    const struct sockaddr_in6 &rhs6 = *(const struct sockaddr_in6*)&rhs;
+    int c = memcmp(&lhs6.sin6_addr, &rhs6.sin6_addr, sizeof(struct in6_addr));
+    if (c == 0) {
+      return ntohs(lhs6.sin6_port) < ntohs(rhs6.sin6_port);
+    }
+    return c < 0;
+  }
+}
+
+bool CompareNextSend::operator()(const SessionMap::iterator &lhs,
+                                 const SessionMap::iterator &rhs) {
+  return lhs->second.next_send > rhs->second.next_send;
+}
 
 // Print the timestamp corresponding to the current time.
 // Deliberately the same format as tcpdump uses, so we can easily sort and
@@ -235,7 +274,7 @@ static int send_packet(struct Session *s, int sock) {
   // receive the timing information for the packets it sent us.
   if (is_server) {
     if (sendto(sock, &s->tx, sizeof(s->tx), 0,
-               s->remoteaddr, s->remoteaddr_len) < 0) {
+               (struct sockaddr *)&s->remoteaddr, s->remoteaddr_len) < 0) {
       perror("sendto");
     }
   } else {
@@ -250,59 +289,84 @@ static int send_packet(struct Session *s, int sock) {
 }
 
 
-int maybe_send_packet(struct Session *s, int sock, uint32_t now) {
-  if (s->remoteaddr && DIFF(now, s->next_send) >= 0) {
-    prepare_tx_packet(s);
-    int err = send_packet(s, sock);
+int send_waiting_packets(Sessions *sessions, int sock, uint32_t now) {
+  if (sessions == NULL) {
+    return -1;
+  }
+  // TODO(pmccurdy): This will incorrectly send packets too early during the
+  // time period where now + usec_per_pkt wraps around, i.e. about once per 71
+  // minutes, and will end up blasting packets as fast as possible for that
+  // duration.  Consider calculating next_send and now as 64-bit values, and
+  // truncating to 32 bits when transmitting.
+  while (sessions->next_sends.size() > 0 &&
+         DIFF(now, sessions->next_send_time()) >= 0) {
+    SessionMap::iterator it = sessions->next_sends.top();
+    sessions->next_sends.pop();
+    Session &s = it->second;
+    prepare_tx_packet(&s);
+    int err = send_packet(&s, sock);
     if (err != 0) {
       return err;
+    }
+    // TODO(pmccurdy): Detect connection refused on a per-client basis.  Use
+    // recvmsg with the MSG_ERRQUEUE flag to get error and client address,
+    // instead of waiting for timeout.
+    // TODO(pmccurdy): Support very low packet-per-second values, e.g. one
+    // packet per hour, without constantly disconnecting the client.
+    if (is_server && DIFF(now, s.last_rxtime) > 60 * 1000 * 1000) {
+      fprintf(stderr, "client %s disconnected.\n",
+              sockaddr_to_str((struct sockaddr *)&s.remoteaddr));
+      sessions->session_map.erase(s.remoteaddr);
+    } else {
+      sessions->next_sends.push(it);
     }
   }
   return 0;
 }
 
-
-int read_incoming_packet(struct Session *s, int sock, uint32_t now) {
-  struct sockaddr_in6 rxaddr;
+int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server) {
+  struct sockaddr_storage rxaddr;
   socklen_t rxaddr_len = 0;
-  // TODO(pmccurdy): Temporary until we properly support multiple clients.
-  static struct sockaddr_in6 last_rxaddr;
 
+  Packet rx;
   rxaddr_len = sizeof(rxaddr);
-  ssize_t got = recvfrom(sock, &s->rx, sizeof(s->rx), 0,
+  ssize_t got = recvfrom(sock, &rx, sizeof(rx), 0,
                          (struct sockaddr *)&rxaddr, &rxaddr_len);
   if (got < 0) {
     int e = errno;
     perror("recvfrom");
     return e;
   }
-  if (got != sizeof(s->rx) || s->rx.magic != htonl(MAGIC)) {
+  if (got != sizeof(rx) || rx.magic != htonl(MAGIC)) {
     fprintf(stderr, "got invalid packet of length %ld\n", (long)got);
     return EINVAL;
   }
 
-  // is it a new client?
+  SessionMap::iterator it;
   if (is_server) {
-    // TODO(pmccurdy): Maintain a hash table of Sessions, look up based
-    // on rxaddr, create a new one if necessary, remove this resetting code.
-    if (!s->remoteaddr ||
-        memcmp(&rxaddr, &last_rxaddr, sizeof(rxaddr)) != 0) {
-      fprintf(stderr, "new client connected: %s\n",
+    it = s->session_map.find(rxaddr);
+    if (it == s->session_map.end()) {
+      fprintf(stderr, "New client connection: %s\n",
               sockaddr_to_str((struct sockaddr *)&rxaddr));
-      memcpy(&last_rxaddr, &rxaddr, sizeof(rxaddr));
-      s->remoteaddr = (struct sockaddr *)&last_rxaddr;
-      s->remoteaddr_len = rxaddr_len;
-
-      s->next_send = now + 10*1000;
-      s->next_tx_id = 1;
-      s->next_rx_id = s->next_rxack_id = 0;
-      s->start_rtxtime = s->start_rxtime = 0;
-      s->num_lost = 0;
-      s->next_txack_index = 0;
-      s->usec_per_pkt = ntohl(s->rx.usec_per_pkt);
-      memset(&s->tx, 0, sizeof(s->tx));
+      // TODO(pmccurdy):  This lets clients unconditionally set the usec_per_pkt
+      // values used.  Add some mechanism to let the server override or reject
+      // this value (e.g. limit to a certain range, or reduce per-client pps as
+      // more clients connect).
+      it = s->NewSession(now + 10 * 1000, ntohl(rx.usec_per_pkt), &rxaddr,
+                         rxaddr_len);
+    }
+  } else {
+    it = s->session_map.begin();
+    if (it == s->session_map.end()) {
+      fprintf(stderr, "No session configured for %s when receiving packet\n",
+              sockaddr_to_str((struct sockaddr *)&rxaddr));
+      return EINVAL;
     }
   }
+  Session &session = it->second;
+  memcpy(&session.rx, &rx, sizeof(session.rx));
+  handle_packet(&session, now);
+
   return 0;
 }
 
@@ -473,7 +537,7 @@ void handle_packet(struct Session *s, uint32_t now) {
       uint32_t rxtime = rrxtime + offset;
       // note: already contains 1/2 rtt, unlike rxdiff
       int32_t txdiff = DIFF(rxtime, txtime);
-      if (s->usec_per_print <= 0 && s->last_ackinfo[0]) {
+      if (!quiet && s->usec_per_print <= 0 && s->last_ackinfo[0]) {
         // only print multiple acks per rx if no usec_per_print limit
         if (want_timestamps) print_timestamp(rxtime);
         printf("%12s\n", s->last_ackinfo);
@@ -550,8 +614,7 @@ int isoping_main(int argc, char **argv) {
   }
 
   uint32_t now = ustime();       // current time
-
-  struct Session s(now);
+  Sessions sessions;
 
   if (argc - optind == 0) {
     is_server = 1;
@@ -588,8 +651,8 @@ int isoping_main(int argc, char **argv) {
       perror("connect");
       return 1;
     }
-    s.remoteaddr = ai->ai_addr;
-    s.remoteaddr_len = ai->ai_addrlen;
+    sessions.NewSession(now, 1e6 / packets_per_sec,
+                        (struct sockaddr_storage *)ai->ai_addr, ai->ai_addrlen);
   } else {
     usage_and_die(argv[0]);
   }
@@ -626,55 +689,53 @@ int isoping_main(int argc, char **argv) {
     tv.tv_sec = 0;
 
     now = ustime();
-    if (DIFF(s.next_send, now) < 0) {
+    if (sessions.next_sends.size() == 0 ||
+        DIFF(sessions.next_send_time(), now) < 0) {
       tv.tv_usec = 0;
     } else {
-      tv.tv_usec = DIFF(s.next_send, now);
+      tv.tv_usec = DIFF(sessions.next_send_time(), now);
     }
-    int nfds = select(sock + 1, &rfds, NULL, NULL, s.remoteaddr ? &tv : NULL);
+    int nfds = select(sock + 1, &rfds, NULL, NULL,
+                      sessions.next_sends.size() > 0 ? &tv : NULL);
     now = ustime();
     if (nfds < 0 && errno != EINTR) {
       perror("select");
       return 1;
     }
 
-    // time to send the next packet?
-    int err = maybe_send_packet(&s, sock, now);
+    int err = send_waiting_packets(&sessions, sock, now);
     if (err != 0) {
       return err;
     }
-    // TODO(pmccurdy): Track disconnections across multiple clients.  Use
-    // recvmsg with the MSG_ERRQUEUE flag to detect connection refused.
-    if (is_server && DIFF(now, s.last_rxtime) > 60 * 1000 * 1000) {
-      fprintf(stderr, "client disconnected.\n");
-      s.remoteaddr = NULL;
-    }
 
     if (nfds > 0) {
-      err = read_incoming_packet(&s, sock, now);
+      err = read_incoming_packet(&sessions, sock, now, is_server);
       if (!is_server && err == ECONNREFUSED) return 2;
       if (err != 0) {
         continue;
       }
-      handle_packet(&s, now);
     }
   }
 
-  // TODO(pmccurdy): Separate out per-client and global stats.
-  printf("\n---\n");
-  printf("tx: min/avg/max/mdev = %.2f/%.2f/%.2f/%.2f ms\n",
-         s.lat_tx_min / 1000.0,
-         DIV(s.lat_tx_sum, s.lat_tx_count) / 1000.0,
-         s.lat_tx_max / 1000.0,
-         onepass_stddev(
-             s.lat_tx_var_sum, s.lat_tx_sum, s.lat_tx_count) / 1000.0);
-  printf("rx: min/avg/max/mdev = %.2f/%.2f/%.2f/%.2f ms\n",
-         s.lat_rx_min / 1000.0,
-         DIV(s.lat_rx_sum, s.lat_rx_count) / 1000.0,
-         s.lat_rx_max / 1000.0,
-         onepass_stddev(
-             s.lat_rx_var_sum, s.lat_rx_sum, s.lat_rx_count) / 1000.0);
-  printf("\n");
+  // TODO(pmccurdy): Separate out per-client and global stats, print stats for
+  // the server when each client disconnects.
+  if (!is_server) {
+    Session &s = sessions.session_map.begin()->second;
+    printf("\n---\n");
+    printf("tx: min/avg/max/mdev = %.2f/%.2f/%.2f/%.2f ms\n",
+           s.lat_tx_min / 1000.0,
+           DIV(s.lat_tx_sum, s.lat_tx_count) / 1000.0,
+           s.lat_tx_max / 1000.0,
+           onepass_stddev(
+               s.lat_tx_var_sum, s.lat_tx_sum, s.lat_tx_count) / 1000.0);
+    printf("rx: min/avg/max/mdev = %.2f/%.2f/%.2f/%.2f ms\n",
+           s.lat_rx_min / 1000.0,
+           DIV(s.lat_rx_sum, s.lat_rx_count) / 1000.0,
+           s.lat_rx_max / 1000.0,
+           onepass_stddev(
+               s.lat_rx_var_sum, s.lat_rx_sum, s.lat_rx_count) / 1000.0);
+    printf("\n");
+  }
 
   if (ai) freeaddrinfo(ai);
   if (sock >= 0) close(sock);

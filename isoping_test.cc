@@ -15,6 +15,7 @@
  */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <limits.h>
 #include <memory.h>
 #include <stdio.h>
@@ -56,10 +57,12 @@ WVTEST_MAIN("isoping algorithm logic") {
   uint32_t cbase = 400 * 1000;
   uint32_t sbase = 600 * 1000;
   uint32_t real_clockdiff = sbase - cbase;
+  uint32_t usec_per_pkt = 100 * 1000;
 
   // The states of the client and server.
-  struct Session c(cbase);
-  struct Session s(sbase);
+  struct sockaddr_storage empty_sockaddr;
+  struct Session c(cbase, usec_per_pkt, empty_sockaddr, sizeof(empty_sockaddr));
+  struct Session s(sbase, usec_per_pkt, empty_sockaddr, sizeof(empty_sockaddr));
 
   // One-way latencies: cs_latency is the latency from client to server;
   // sc_latency is from server to client.
@@ -72,9 +75,6 @@ WVTEST_MAIN("isoping algorithm logic") {
 
   // Send the initial packet from client to server.  This isn't enough to let us
   // draw any useful latency conclusions.
-  // TODO(pmccurdy): Setting next_send is duplicating some work done in the main
-  // loop / send_packet.  Extract that into somewhere testable, then test it.
-  c.next_send = cbase;
   t = send_next_packet(&c, cbase, &s, sbase, cs_latency);
   uint32_t rxtime = sbase + t;
   s.next_send = rxtime + 10 * 1000;
@@ -256,10 +256,12 @@ WVTEST_MAIN("isoping algorithm logic") {
 WVTEST_MAIN("isoping clock drift") {
   uint32_t cbase = 1400 * 1000;
   uint32_t sbase = 1600 * 1000;
+  uint32_t usec_per_pkt = 100 * 1000;
 
   // The states of the client and server.
-  struct Session c(cbase);
-  struct Session s(sbase);
+  struct sockaddr_storage empty_sockaddr;
+  struct Session c(cbase, usec_per_pkt, empty_sockaddr, sizeof(empty_sockaddr));
+  struct Session s(sbase, usec_per_pkt, empty_sockaddr, sizeof(empty_sockaddr));
   // Send packets infrequently, to get new cycles more often.
   s.usec_per_pkt = 1 * 1000 * 1000;
   c.usec_per_pkt = 1 * 1000 * 1000;
@@ -424,10 +426,6 @@ WVTEST_MAIN("Send and receive on sockets") {
   uint32_t cbase = 1400 * 1000;
   uint32_t sbase = 1600 * 1000;
 
-  // The states of the client and server.
-  struct Session c(cbase);
-  struct Session s(sbase);
-
   // Sockets for the client and server.
   int ssock, csock;
   struct addrinfo hints, *res;
@@ -461,7 +459,7 @@ WVTEST_MAIN("Send and receive on sockets") {
   }
 
   // Figure out the local port we got.
-  struct sockaddr_in6 listenaddr;
+  struct sockaddr_storage listenaddr;
   socklen_t listenaddr_len = sizeof(listenaddr);
   memset(&listenaddr, 0, listenaddr_len);
   if (!WVPASS(!getsockname(ssock, (struct sockaddr *)&listenaddr,
@@ -470,7 +468,10 @@ WVTEST_MAIN("Send and receive on sockets") {
     return;
   }
 
-  printf("Bound server socket to port=%d\n", listenaddr.sin6_port);
+  printf("Bound server socket to port=%d\n",
+         listenaddr.ss_family == AF_INET
+             ? ntohs(((struct sockaddr_in *)&listenaddr)->sin_port)
+             : ntohs(((struct sockaddr_in6 *)&listenaddr)->sin6_port));
 
   // Connect the client's socket.
   if (!WVPASS(
@@ -478,14 +479,30 @@ WVTEST_MAIN("Send and receive on sockets") {
     perror("connect");
     return;
   }
+  struct sockaddr_in6 caddr;
+  socklen_t caddr_len = sizeof(caddr);
+  memset(&caddr, 0, caddr_len);
+  if (!WVPASS(!getsockname(csock, (struct sockaddr *)&caddr, &caddr_len))) {
+    perror("getsockname");
+    return;
+  }
+  char buf[128];
+  inet_ntop(AF_INET6, (struct sockaddr *)&caddr, buf, sizeof(buf));
+  printf("Created client connection on %s:%d\n", buf, ntohs(caddr.sin6_port));
 
-  c.remoteaddr = (struct sockaddr *)&listenaddr;
-  c.remoteaddr_len = listenaddr_len;
+  // All active sessions for the client and server.
+  Sessions c;
+  Sessions s;
+  uint32_t usec_per_pkt = 100 * 1000;
+
+  c.NewSession(cbase + 1, usec_per_pkt, &listenaddr, listenaddr_len);
 
   uint32_t cs_latency = 4000;
   uint32_t sc_latency = 5000;
-  uint32_t t = c.usec_per_pkt - 1;
-  WVPASS(!maybe_send_packet(&c, csock, cbase + t));
+
+  Session &cSession = c.session_map.begin()->second;
+  uint32_t t = cSession.next_send - cbase - 1;
+  WVPASS(!send_waiting_packets(&c, csock, cbase + t));
 
   // Verify we didn't send a packet before its time.
   fd_set rfds;
@@ -497,8 +514,8 @@ WVTEST_MAIN("Send and receive on sockets") {
 
   // Send a packet in each direction.
   t += 1;
-  WVPASS(!maybe_send_packet(&c, csock, cbase + t));
-  WVPASSEQ(c.next_tx_id, 2);
+  WVPASS(!send_waiting_packets(&c, csock, cbase + t));
+  WVPASSEQ(cSession.next_tx_id, 2);
 
   FD_ZERO(&rfds);
   FD_SET(ssock, &rfds);
@@ -506,23 +523,26 @@ WVTEST_MAIN("Send and receive on sockets") {
   WVPASSEQ(nfds, 1);
 
   t += cs_latency;
-  WVPASS(!read_incoming_packet(&s, ssock, sbase + t));
+  int is_server = 1;
+  int is_client = 0;
+  WVPASS(!read_incoming_packet(&s, ssock, sbase + t, is_server));
+  WVPASSEQ(s.session_map.size(), 1);
+  WVPASSEQ(s.next_sends.size(), 1);
+  WVPASSEQ(s.next_send_time(), sbase + t + 10 * 1000);
 
-  WVPASS(s.remoteaddr != NULL);
-  WVPASS(s.remoteaddr_len > 0);
-  WVPASSEQ(s.next_tx_id, 1);
+  WVPASSEQ(s.session_map.size(), 1);
+  Session &sSession = s.session_map.begin()->second;
+  WVPASS(sSession.remoteaddr_len > 0);
+  WVPASSEQ(sSession.next_tx_id, 1);
 
-  handle_packet(&s, sbase + t);
-
-  t = s.next_send - sbase;
-  WVPASS(!maybe_send_packet(&s, ssock, sbase + t));
-  WVPASSEQ(s.next_send, sbase + t + s.usec_per_pkt);
-  WVPASSEQ(s.next_tx_id, 2);
+  t = s.next_send_time() - sbase;
+  WVPASS(!send_waiting_packets(&s, ssock, sbase + t));
+  WVPASSEQ(s.next_send_time(), sbase + t + sSession.usec_per_pkt);
+  WVPASSEQ(sSession.next_tx_id, 2);
 
   t += sc_latency;
-  WVPASS(!read_incoming_packet(&c, csock, cbase + t));
-  handle_packet(&c, cbase + t);
-  WVPASSEQ(c.lat_rx_count, 1);
+  WVPASS(!read_incoming_packet(&c, csock, cbase + t, is_client));
+  WVPASSEQ(cSession.lat_rx_count, 1);
 
   // Verify we reject garbage data.
   Packet p;
@@ -532,19 +552,18 @@ WVTEST_MAIN("Send and receive on sockets") {
     return;
   }
 
-  WVPASSEQ(read_incoming_packet(&s, ssock, sbase + t), EINVAL);
+  WVPASSEQ(read_incoming_packet(&s, ssock, sbase + t, is_server), EINVAL);
 
-  // Make a new client, getting a new source port.
-  struct Session c2(cbase);
-  c2.usec_per_pkt *= 2;
-  c2.remoteaddr = c.remoteaddr;
-  c2.remoteaddr_len = c.remoteaddr_len;
+  // Make a new client, who sends more frequently, getting a new source port.
+  Sessions c2;
+  c2.NewSession(cbase, usec_per_pkt/4, &listenaddr, listenaddr_len);
   int c2sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
   if (!WVPASS(c2sock > 0)) {
     perror("client socket 2");
     return;
   }
-  if (!WVPASS(!connect(c2sock, c.remoteaddr, c.remoteaddr_len))) {
+  if (!WVPASS(
+          !connect(c2sock, (struct sockaddr *)&listenaddr, listenaddr_len))) {
     perror("connect");
     return;
   }
@@ -555,20 +574,22 @@ WVTEST_MAIN("Send and receive on sockets") {
     perror("getsockname");
     return;
   }
+  inet_ntop(AF_INET6, (struct sockaddr *)&c2addr, buf, sizeof(buf));
+  printf("Created new client connection on %s:%d\n", buf,
+         ntohs(c2addr.sin6_port));
 
-  t = c2.next_send - cbase;
-  WVPASS(!maybe_send_packet(&c2, c2sock, cbase + t));
+  Session &c2Session = c2.session_map.begin()->second;
+  t = c2Session.next_send - cbase;
+  WVPASS(!send_waiting_packets(&c2, c2sock, cbase + t));
 
   t += cs_latency;
 
-  // Check that a new client resets some state.
-  WVPASS(!read_incoming_packet(&s, ssock, sbase + t));
-
-  WVPASSEQ(ntohs(((sockaddr_in6 *)s.remoteaddr)->sin6_port),
-           ntohs(c2addr.sin6_port));
-  WVPASSEQ(s.next_tx_id, 1);
-  WVPASSEQ(s.next_rx_id, 0);
-  WVPASSEQ(s.usec_per_pkt, c2.usec_per_pkt);
+  // Check that a new client is added to the server's state, and it will be sent
+  // next.
+  WVPASS(!read_incoming_packet(&s, ssock, sbase + t, is_server));
+  WVPASSEQ(s.session_map.size(), 2);
+  WVPASSEQ(s.next_sends.size(), 2);
+  WVPASSEQ(s.next_send_time(), sbase + t + 10 * 1000);
 
   // Cleanup
   close(ssock);
