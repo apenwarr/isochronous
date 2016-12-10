@@ -18,9 +18,22 @@
 
 #include <map>
 #include <netinet/in.h>
+#include <openssl/evp.h>
 #include <queue>
+#include <random>
 #include <stdint.h>
+#include <string.h>
 #include <sys/socket.h>
+
+// Number of bytes required to store the cookie, which is a SHA-256 hash.
+#define COOKIE_SIZE 32
+// Number of bytes used to store the random cookie secret.
+#define COOKIE_SECRET_SIZE 16
+
+enum {
+  PACKET_TYPE_ACK = 0,
+  PACKET_TYPE_HANDSHAKE,
+};
 
 // Layout of the UDP packets exchanged between client and server.
 // All integers are in network byte order.
@@ -32,12 +45,22 @@ struct Packet {
   uint32_t clockdiff; // estimate of (transmitter's clk) - (receiver's clk)
   uint32_t usec_per_pkt; // microseconds of delay between packets
   uint32_t num_lost;  // number of pkts transmitter expected to get but didn't
-  uint32_t first_ack; // starting index in acks[] circular buffer
-  struct {
-    // txtime==0 for empty elements in this array.
-    uint32_t id;      // id field from a received packet
-    uint32_t rxtime;  // receiver's monotonic time when pkt arrived
-  } acks[64];
+  uint8_t packet_type; // 0 for acks, 1 for handshake packet
+  uint8_t first_ack;  // starting index in acks[] circular buffer
+  union {
+    // Data used for handshake packets.
+    struct {
+      uint32_t version; // max version of the isoping protocol supported
+      uint32_t cookie_epoch; // which cookie we're using
+      unsigned char cookie[COOKIE_SIZE]; // actual cookie value
+    } handshake;
+    // Data used for ack packets.
+    struct {
+      // txtime==0 for empty elements in this array.
+      uint32_t id;      // id field from a received packet
+      uint32_t rxtime;  // receiver's monotonic time when pkt arrived
+    } acks[64];
+  } data;
 };
 
 
@@ -51,6 +74,15 @@ struct Session {
   // The peer's address.
   struct sockaddr_storage remoteaddr;
   socklen_t remoteaddr_len;
+
+  enum {
+    NEW_SESSION = 0,     // No packets exchanged yet.
+    HANDSHAKE_REQUESTED, // Client has sent initial packet to server, i.e. SYN.
+    COOKIE_GENERATED,    // Server has replied with cookie, i.e. SYN|ACK.
+    ESTABLISHED          // Client has echoed cookie back, i.e. ACK.
+  } handshake_state;
+  int handshake_retry_count;
+  static const int handshake_timeout_usec = 1000000;
 
   // WARNING: lots of math below relies on well-defined uint32/int32
   // arithmetic overflow behaviour, plus the fact that when we subtract
@@ -98,14 +130,34 @@ struct CompareNextSend {
 
 struct Sessions {
  public:
-  Sessions() {}
+  Sessions()
+      : md(EVP_sha256()),
+        rng(std::random_device()()),
+        cookie_epoch(0) {
+    NewRandomCookieSecret();
+    EVP_MD_CTX_init(&digest_context);
+  }
 
-  // All active sessions, indexed by remote address/port.
-  SessionMap session_map;
-  // A queue of upcoming send times, ordered most recent first, referencing
-  // entries in the session map.
-  std::priority_queue<SessionMap::iterator, std::vector<SessionMap::iterator>,
-      CompareNextSend> next_sends;
+  ~Sessions() {
+    EVP_MD_CTX_cleanup(&digest_context);
+  }
+
+  // Rotates the cookie secrets if they haven't been changed in a while.
+  void MaybeRotateCookieSecrets();
+
+  // Rotate the cookie secrets using the given epoch directly.  Only for use in
+  // unit tests.
+  void RotateCookieSecrets(uint32_t new_epoch);
+
+  // Calculates a handshake cookie based on the provided client IP address and
+  // the relevant parameters in p, using the current cookie secret, and places
+  // the result in p.
+  bool CalculateCookie(Packet *p, struct sockaddr_storage *remoteaddr,
+                       size_t remoteaddr_len);
+
+  // Returns true if the packet contains a handshake packet with a valid cookie.
+  bool ValidateCookie(Packet *p, struct sockaddr_storage *addr,
+                      socklen_t addr_len);
 
   SessionMap::iterator NewSession(uint32_t first_send,
                                   uint32_t usec_per_pkt,
@@ -118,17 +170,58 @@ struct Sessions {
     }
     return next_sends.top()->second.next_send;
   }
+
+  // All active sessions, indexed by remote address/port.
+  SessionMap session_map;
+  // A queue of upcoming send times, ordered most recent first, referencing
+  // entries in the session map.
+  std::priority_queue<SessionMap::iterator, std::vector<SessionMap::iterator>,
+      CompareNextSend> next_sends;
+
+ private:
+  void NewRandomCookieSecret();
+  bool CalculateCookieWithSecret(Packet *p, struct sockaddr_storage *remoteaddr,
+                                 size_t remoteaddr_len, unsigned char *secret,
+                                 size_t secret_len);
+
+  // Fields required for calculating and verifying cookies.
+  EVP_MD_CTX digest_context;
+  const EVP_MD *md;
+  std::mt19937_64 rng;
+  uint32_t cookie_epoch;
+  unsigned char cookie_secret[COOKIE_SECRET_SIZE];
+  uint32_t prev_cookie_epoch;
+  unsigned char prev_cookie_secret[COOKIE_SECRET_SIZE];
 };
 
-// Process the Session's incoming packet, from s->rx.
-void handle_packet(struct Session *s, uint32_t now);
+// Process an incoming packet from the socket.
+void handle_packet(struct Sessions *s, struct Session *session, Packet *rx,
+                   int sock, struct sockaddr_storage *rxaddr,
+                   socklen_t rxaddr_len, uint32_t now, int is_server);
+
+// Process an established Session's incoming ack packet, from s->rx.
+void handle_ack_packet(struct Session *s, uint32_t now);
+
+// Server-only: processes a handshake packet from a new client in rx. Replies
+// with a cookie if no cookie provided, or validates the provided cookie and
+// establishes a new Session.
+void handle_new_client_handshake_packet(Sessions *s, Packet *rx, int sock,
+                                       struct sockaddr_storage *remoteaddr,
+                                       size_t remoteaddr_len, uint32_t now);
+
+// Client-only: processes a handshake packet received from the server.
+// Configures the Session to echo the provided cookie back to the server.
+void handle_server_handshake_packet(Sessions *s, Packet *rx, uint32_t now);
 
 // Sets all the elements of s->tx to be ready to be sent to the other side.
 void prepare_tx_packet(struct Session *s);
 
 // Sends a packet to all waiting sessions where the appropriate amount of time
 // has passed.
-int send_waiting_packets(Sessions *s, int sock, uint32_t now);
+int send_waiting_packets(Sessions *s, int sock, uint32_t now, int is_server);
+
+// Sends a packet from the given session to the given socket immediately.
+int send_packet(struct Session *s, int sock, int is_server);
 
 // Reads a packet from sock and stores it in s->rx.  Assumes a packet is
 // currently readable.

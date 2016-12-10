@@ -27,6 +27,7 @@
 #include "isoping.h"
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <math.h>
 #include <memory.h>
@@ -65,9 +66,13 @@
 #define DIV(x, y) ((y) ? ((double)(x)/(y)) : 0)
 #define _STR(n) #n
 #define STR(n) _STR(n)
+#ifdef DEBUG
+#define DLOG(args...) fprintf(stderr, args)
+#else
+#define DLOG(args...)
+#endif
 
 // Global flag values.
-int is_server = 1;
 int quiet = 0;
 int ttl = DEFAULT_TTL;
 int want_timestamps = 0;
@@ -81,11 +86,47 @@ static void sighandler(int sig) {
   want_to_die = 1;
 }
 
+// Render the given sockaddr as a string.  (Uses a static internal buffer
+// which is overwritten each time.)
+static const char *sockaddr_to_str(struct sockaddr *sa) {
+  static char addrbuf[128];
+  void *aptr;
+
+  switch (sa->sa_family) {
+  case AF_INET:
+    aptr = &((struct sockaddr_in *)sa)->sin_addr;
+    break;
+  case AF_INET6:
+    aptr = &((struct sockaddr_in6 *)sa)->sin6_addr;
+    break;
+  default:
+    return "unknown";
+  }
+
+  if (!inet_ntop(sa->sa_family, aptr, addrbuf, sizeof(addrbuf))) {
+    perror("inet_ntop");
+    exit(98);
+  }
+  return addrbuf;
+}
+
+static void debug_print_hex(unsigned char *data, size_t data_len) {
+  for (size_t i = 0; i < data_len; i++) {
+    DLOG("%02x", data[i]);
+    if (i % 8 == 7) {
+      DLOG(" ");
+    }
+  }
+  DLOG("\n");
+}
+
 Session::Session(uint32_t first_send, uint32_t usec_per_pkt,
                  const struct sockaddr_storage &raddr, size_t raddr_len)
     : usec_per_pkt(usec_per_pkt),
       usec_per_print(prints_per_sec > 0 ? 1e6 / prints_per_sec : 0),
       remoteaddr_len(raddr_len),
+      handshake_state(NEW_SESSION),
+      handshake_retry_count(0),
       next_tx_id(1),
       next_rx_id(0),
       next_rxack_id(0),
@@ -105,6 +146,7 @@ Session::Session(uint32_t first_send, uint32_t usec_per_pkt,
   memcpy(&remoteaddr, &raddr, raddr_len);
   memset(&tx, 0, sizeof(tx));
   strcpy(last_ackinfo, "");
+  DLOG("Handshake state: NEW_SESSION\n");
 }
 
 SessionMap::iterator Sessions::NewSession(uint32_t first_send,
@@ -115,6 +157,103 @@ SessionMap::iterator Sessions::NewSession(uint32_t first_send,
       *addr, Session(first_send, usec_per_pkt, *addr, addr_len)));
   next_sends.push(p.first);
   return p.first;
+}
+
+bool Sessions::CalculateCookie(Packet *p, struct sockaddr_storage *remoteaddr,
+                               size_t remoteaddr_len) {
+  return CalculateCookieWithSecret(p, remoteaddr, remoteaddr_len,
+                                   cookie_secret, sizeof(cookie_secret));
+}
+
+bool Sessions::CalculateCookieWithSecret(Packet *p,
+                                         struct sockaddr_storage *remoteaddr,
+                                         size_t remoteaddr_len,
+                                         unsigned char *secret,
+                                         size_t secret_len) {
+  if (p->packet_type != PACKET_TYPE_HANDSHAKE) {
+    fprintf(stderr, "Tried to create cookie for a non-handshake packet\n");
+    return false;
+  }
+  if (!EVP_DigestInit_ex(&digest_context, md, NULL)) {
+    fprintf(stderr, "Unable to initialize hash digest\n");
+    return false;
+  }
+
+  // Hash the data
+  EVP_DigestUpdate(&digest_context, secret, secret_len);
+  EVP_DigestUpdate(&digest_context, &p->usec_per_pkt, sizeof(p->usec_per_pkt));
+  EVP_DigestUpdate(&digest_context, remoteaddr, remoteaddr_len);
+
+  unsigned int digest_size = 0;
+  EVP_DigestFinal_ex(&digest_context, p->data.handshake.cookie, &digest_size);
+  if (digest_size != COOKIE_SIZE) {
+    fprintf(stderr, "Invalid digest size %d for cookie; expected %d\n",
+            digest_size, COOKIE_SIZE);
+    return false;
+  }
+  p->data.handshake.cookie_epoch = cookie_epoch;
+  return true;
+}
+
+bool Sessions::ValidateCookie(Packet *p, struct sockaddr_storage *addr,
+                              socklen_t addr_len) {
+  if (p->data.handshake.cookie_epoch != cookie_epoch &&
+      p->data.handshake.cookie_epoch != prev_cookie_epoch) {
+    fprintf(stderr, "Obsolete cookie epoch: %d\n",
+            p->data.handshake.cookie_epoch);
+    return false;
+  }
+  Packet golden;
+  golden.packet_type = PACKET_TYPE_HANDSHAKE;
+  golden.usec_per_pkt = p->usec_per_pkt;
+  if (p->data.handshake.cookie_epoch == cookie_epoch) {
+    CalculateCookieWithSecret(&golden, addr, addr_len, cookie_secret,
+                              sizeof(cookie_secret));
+  } else {
+    CalculateCookieWithSecret(&golden, addr, addr_len, prev_cookie_secret,
+                              sizeof(prev_cookie_secret));
+  }
+  DLOG("Handshake: cookie epoch=%d, cookie=0x",
+       p->data.handshake.cookie_epoch);
+  debug_print_hex(p->data.handshake.cookie, sizeof(p->data.handshake.cookie));
+  DLOG("Expected handshake: cookie epoch=%d, cookie=0x",
+       golden.data.handshake.cookie_epoch);
+  debug_print_hex(golden.data.handshake.cookie,
+                  sizeof(golden.data.handshake.cookie));
+  if (memcmp(golden.data.handshake.cookie, p->data.handshake.cookie,
+             COOKIE_SIZE)) {
+    fprintf(stderr, "Invalid cookie in handshake packet from %s\n",
+            sockaddr_to_str((struct sockaddr *)addr));
+    return false;
+  }
+  return true;
+}
+
+void Sessions::MaybeRotateCookieSecrets() {
+  // Round off the unix timestamp to 64 seconds as an epoch, so we don't have to
+  // track which ones we've already used.
+  uint32_t new_epoch = time(NULL) >> 6;
+  if (new_epoch != cookie_epoch) {
+    RotateCookieSecrets(new_epoch);
+  }
+}
+
+void Sessions::RotateCookieSecrets(uint32_t new_epoch) {
+  prev_cookie_epoch = cookie_epoch;
+  memcpy(&prev_cookie_secret[0], &cookie_secret[0],
+         sizeof(prev_cookie_secret));
+  cookie_epoch = new_epoch;
+  NewRandomCookieSecret();
+}
+
+void Sessions::NewRandomCookieSecret() {
+  uint64_t random;
+  for (size_t i = 0; i < sizeof(cookie_secret); i += sizeof(random)) {
+    random = rng();
+    memcpy(&cookie_secret[i], &random,
+           std::min(sizeof(random), sizeof(cookie_secret) - i));
+  }
+  DLOG("Generated new cookie secret.\n");
 }
 
 // Returns the kernel monotonic timestamp in microseconds, truncated to
@@ -176,30 +315,6 @@ static void usage_and_die(char *argv0) {
 }
 
 
-// Render the given sockaddr as a string.  (Uses a static internal buffer
-// which is overwritten each time.)
-static const char *sockaddr_to_str(struct sockaddr *sa) {
-  static char addrbuf[128];
-  void *aptr;
-
-  switch (sa->sa_family) {
-  case AF_INET:
-    aptr = &((struct sockaddr_in *)sa)->sin_addr;
-    break;
-  case AF_INET6:
-    aptr = &((struct sockaddr_in6 *)sa)->sin6_addr;
-    break;
-  default:
-    return "unknown";
-  }
-
-  if (!inet_ntop(sa->sa_family, aptr, addrbuf, sizeof(addrbuf))) {
-    perror("inet_ntop");
-    exit(98);
-  }
-  return addrbuf;
-}
-
 bool CompareSockaddr::operator()(const struct sockaddr_storage &lhs,
                                  const struct sockaddr_storage &rhs) {
   if (lhs.ss_family != rhs.ss_family) {
@@ -254,6 +369,26 @@ static double onepass_stddev(long long sumsq, long long sum, long long count) {
   return sqrt(DIV(numer, denom));
 }
 
+static void debug_print_packet(Packet *p) {
+  DLOG("Packet contents: magic=0x%x id=%d usec_per_pkt=%d txtime=%u "
+       "clockdiff=%d num_lost=%d first_ack=%d type=%d\n",
+       ntohl(p->magic), ntohl(p->id), ntohl(p->usec_per_pkt),
+       ntohl(p->txtime), ntohl(p->clockdiff), ntohl(p->num_lost),
+       p->first_ack, p->packet_type);
+  if (p->packet_type == PACKET_TYPE_HANDSHAKE) {
+    DLOG("cookie epoch=%u, cookie=0x", p->data.handshake.cookie_epoch);
+    debug_print_hex(p->data.handshake.cookie, sizeof(p->data.handshake.cookie));
+  } else {
+    DLOG("Acks:\n");
+    for (uint32_t i = 0; i < ARRAY_LEN(p->data.acks); i++) {
+      uint32_t acki = (p->first_ack + i) % ARRAY_LEN(p->data.acks);
+      uint32_t ackid = ntohl(p->data.acks[acki].id);
+      if (!ackid) continue;  // empty slot
+      DLOG(" acki=%d id=%d rxtime=%u\n",
+           acki, ackid, ntohl(p->data.acks[acki].rxtime));
+    }
+  }
+}
 
 void prepare_tx_packet(struct Session *s) {
   s->tx.magic = htonl(MAGIC);
@@ -263,33 +398,89 @@ void prepare_tx_packet(struct Session *s) {
   s->tx.clockdiff = s->start_rtxtime ?
       htonl(s->start_rxtime - s->start_rtxtime) : 0;
   s->tx.num_lost = htonl(s->num_lost);
-  s->tx.first_ack = htonl(s->next_txack_index);
+  s->tx.first_ack = s->next_txack_index;
+  switch (s->handshake_state) {
+    case Session::NEW_SESSION:
+    case Session::HANDSHAKE_REQUESTED:
+    case Session::COOKIE_GENERATED:
+      DLOG("prepare_tx_packet: Sending handshake packet\n");
+      s->tx.packet_type = PACKET_TYPE_HANDSHAKE;
+      break;
+    case Session::ESTABLISHED:
+      s->tx.packet_type = PACKET_TYPE_ACK;
+      break;
+    default:
+      fprintf(stderr, "Unknown handshake state %d\n", s->handshake_state);
+      exit(2);
+  }
+  // note: tx.data.acks[] is filled in incrementally; we just transmit the
+  // current state of it here.  The reason we keep a list of the most recent
+  // acks is in case our packet gets lost, so the receiver will have more
+  // chances to receive the timing information for the packets it sent us.
+  debug_print_packet(&s->tx);
 }
 
 
-static int send_packet(struct Session *s, int sock) {
-  // note: tx.acks[] is filled in incrementally; we just transmit the current
-  // state of it here.  The reason we keep a list of the most recent acks is in
-  // case our packet gets lost, so the receiver will have more chances to
-  // receive the timing information for the packets it sent us.
+void prepare_handshake_reply_packet(Packet *tx, Packet *rx, uint32_t now) {
+  memset(tx, 0, sizeof(*tx));
+  tx->magic = htonl(MAGIC);
+  tx->id = rx->id;
+  // TODO(pmccurdy): Establish limits on the allowed usec_per_pkt values here
+  tx->usec_per_pkt = rx->usec_per_pkt;
+  tx->txtime = now;
+  tx->clockdiff = htonl(now - ntohl(rx->txtime));
+  tx->num_lost = htonl(0);
+  tx->packet_type = PACKET_TYPE_HANDSHAKE;
+}
+
+
+int send_packet(struct Session *s, int sock, int is_server) {
   if (is_server) {
     if (sendto(sock, &s->tx, sizeof(s->tx), 0,
                (struct sockaddr *)&s->remoteaddr, s->remoteaddr_len) < 0) {
       perror("sendto");
     }
   } else {
+    DLOG("Calling send on socket %d, size=%ld\n", sock, sizeof(s->tx));
     if (send(sock, &s->tx, sizeof(s->tx), 0) < 0) {
       int e = errno;
       perror("send");
       if (e == ECONNREFUSED) return 2;
     }
   }
-  s->next_send += s->usec_per_pkt;
+  if (is_server ||
+      s->handshake_state == Session::ESTABLISHED ||
+      s->handshake_state == Session::COOKIE_GENERATED) {
+    DLOG("send_packet: ack packet, next_send in %d (from %d to %d)\n",
+         s->usec_per_pkt, s->next_send, s->next_send + s->usec_per_pkt);
+    s->next_send += s->usec_per_pkt;
+  } else {
+    // Handle resending handshake packets from the client.  If they get lost
+    // before we get a valid cookie from the server, the server won't know about
+    // us, and our normal retry procedure would get us out of sync.
+    if (s->handshake_state == Session::NEW_SESSION) {
+      DLOG("Handshake state: sending handshake packet, moving to "
+           "HANDSHAKE_REQUESTED\n");
+      s->handshake_state = Session::HANDSHAKE_REQUESTED;
+      s->handshake_retry_count = 0;
+    } else {
+      s->handshake_retry_count++;
+    }
+    // Limit the backoff to a factor of 2^10.
+    uint32_t timeout = Session::handshake_timeout_usec *
+                       (1 << std::min(10, s->handshake_retry_count));
+    DLOG("Sending handshake, retries=%d, next_send in %d us (from %u to %u)\n",
+         s->handshake_retry_count, timeout, s->next_send,
+         s->next_send + timeout);
+    s->next_send += timeout;
+    // Don't count the handshake packet as part of the sequence.
+    s->next_tx_id--;
+  }
   return 0;
 }
 
-
-int send_waiting_packets(Sessions *sessions, int sock, uint32_t now) {
+int send_waiting_packets(Sessions *sessions, int sock, uint32_t now,
+                         int is_server) {
   if (sessions == NULL) {
     return -1;
   }
@@ -304,7 +495,7 @@ int send_waiting_packets(Sessions *sessions, int sock, uint32_t now) {
     sessions->next_sends.pop();
     Session &s = it->second;
     prepare_tx_packet(&s);
-    int err = send_packet(&s, sock);
+    int err = send_packet(&s, sock, is_server);
     if (err != 0) {
       return err;
     }
@@ -313,6 +504,9 @@ int send_waiting_packets(Sessions *sessions, int sock, uint32_t now) {
     // instead of waiting for timeout.
     // TODO(pmccurdy): Support very low packet-per-second values, e.g. one
     // packet per hour, without constantly disconnecting the client.
+    // TODO(pmccurdy): Instead of a fixed timeout, evict clients if they miss
+    // a certain number of expected transmissions, that number changing based on
+    // the number of packets they've already sent.
     if (is_server && DIFF(now, s.last_rxtime) > 60 * 1000 * 1000) {
       fprintf(stderr, "client %s disconnected.\n",
               sockaddr_to_str((struct sockaddr *)&s.remoteaddr));
@@ -326,10 +520,9 @@ int send_waiting_packets(Sessions *sessions, int sock, uint32_t now) {
 
 int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server) {
   struct sockaddr_storage rxaddr;
-  socklen_t rxaddr_len = 0;
+  socklen_t rxaddr_len = sizeof(rxaddr);
 
   Packet rx;
-  rxaddr_len = sizeof(rxaddr);
   ssize_t got = recvfrom(sock, &rx, sizeof(rx), 0,
                          (struct sockaddr *)&rxaddr, &rxaddr_len);
   if (got < 0) {
@@ -338,40 +531,171 @@ int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server) {
     return e;
   }
   if (got != sizeof(rx) || rx.magic != htonl(MAGIC)) {
-    fprintf(stderr, "got invalid packet of length %ld\n", (long)got);
+    fprintf(stderr, "got invalid packet of length %ld, magic=%d from %s\n",
+            (long)got, ntohl(rx.magic),
+            sockaddr_to_str((struct sockaddr *)&rxaddr));
     return EINVAL;
   }
+  switch (rx.packet_type) {
+    case PACKET_TYPE_HANDSHAKE:
+    case PACKET_TYPE_ACK:
+      break;
+    default:
+      fprintf(stderr, "received unknown packet type %d\n", rx.packet_type);
+      return EINVAL;
+  }
 
-  SessionMap::iterator it;
+  Session *session = NULL;
   if (is_server) {
-    it = s->session_map.find(rxaddr);
-    if (it == s->session_map.end()) {
-      fprintf(stderr, "New client connection: %s\n",
-              sockaddr_to_str((struct sockaddr *)&rxaddr));
-      // TODO(pmccurdy):  This lets clients unconditionally set the usec_per_pkt
-      // values used.  Add some mechanism to let the server override or reject
-      // this value (e.g. limit to a certain range, or reduce per-client pps as
-      // more clients connect).
-      it = s->NewSession(now + 10 * 1000, ntohl(rx.usec_per_pkt), &rxaddr,
-                         rxaddr_len);
+    SessionMap::iterator it = s->session_map.find(rxaddr);
+    if (it != s->session_map.end()) {
+      session = &it->second;
+    } else {
+      // Note: we don't want to allocate any memory here until the client has
+      // completed the handshake.
+      if (rx.packet_type != PACKET_TYPE_HANDSHAKE) {
+        fprintf(stderr, "Received non-handshake packet from unknown client\n");
+        // TODO(pmccurdy): Reply with a new handshake packet, including a
+        // cookie; we may have dropped a legit client and we need to tell them
+        // to renegotiate.
+        return -1;
+      }
     }
   } else {
-    it = s->session_map.begin();
+    SessionMap::iterator it = s->session_map.begin();
     if (it == s->session_map.end()) {
       fprintf(stderr, "No session configured for %s when receiving packet\n",
               sockaddr_to_str((struct sockaddr *)&rxaddr));
       return EINVAL;
     }
+    DLOG("read_incoming_packet: Client received %s packet from server\n",
+         rx.packet_type == PACKET_TYPE_ACK ? "ack" : "handshake");
+    session = &it->second;
   }
-  Session &session = it->second;
-  memcpy(&session.rx, &rx, sizeof(session.rx));
-  handle_packet(&session, now);
+  handle_packet(s, session, &rx, sock, &rxaddr, rxaddr_len, now, is_server);
 
   return 0;
 }
 
+// Checks what kind of packet we've received, and processes it appropriately.
+// Session may be null if we're dealing with a handshake packet for a new
+// connection.
+void handle_packet(struct Sessions *s, struct Session *session, Packet *rx,
+                   int sock, struct sockaddr_storage *rxaddr,
+                   socklen_t rxaddr_len, uint32_t now, int is_server) {
+  switch (rx->packet_type) {
+    case PACKET_TYPE_HANDSHAKE:
+      if (is_server) {
+        handle_new_client_handshake_packet(s, rx, sock, rxaddr, rxaddr_len,
+                                           now);
+        return;
+      } else {
+        DLOG("Client received handshake packet from server\n");
+        handle_server_handshake_packet(s, rx, now);
+        return;
+      }
+      break;
+    case PACKET_TYPE_ACK:
+      if (session != NULL) {
+        memcpy(&session->rx, rx, sizeof(session->rx));
+        if (!is_server &&
+            session->handshake_state == Session::COOKIE_GENERATED) {
+          // Now we know the server has accepted our connection.  Clear out the
+          // handshake data from the send buffer and prepare to track acks.
+          DLOG("Ack from server on new connection; moving to state "
+               "ESTABLISHED.");
+          session->handshake_state = Session::ESTABLISHED;
+          memset(&session->tx.data.acks, 0, sizeof(session->tx.data.acks));
+        }
+      }
+      handle_ack_packet(session, now);
+      break;
+    default:
+      fprintf(stderr, "handle_packet called for unknown packet type %d\n",
+              rx->packet_type);
+      break;
+  }
+}
 
-void handle_packet(struct Session *s, uint32_t now) {
+void handle_new_client_handshake_packet(Sessions *s, Packet *rx, int sock,
+                                       struct sockaddr_storage *remoteaddr,
+                                       size_t remoteaddr_len, uint32_t now) {
+  assert(s != NULL);
+  assert(rx != NULL);
+  assert(remoteaddr != NULL);
+  DLOG("Server received handshake packet from client; cookie epoch=%u\n",
+       rx->data.handshake.cookie_epoch);
+  if (rx->data.handshake.cookie_epoch == 0) {
+    // New connection with no cookie.  Return a cookie to validate the client.
+    s->session_map.erase(*remoteaddr);
+    fprintf(stderr, "New connection from %s, sending cookie\n",
+            sockaddr_to_str((struct sockaddr *)remoteaddr));
+    Packet tx;
+    memset(&tx, 0, sizeof(tx));
+    prepare_handshake_reply_packet(&tx, rx, now);
+    s->CalculateCookie(&tx, remoteaddr, remoteaddr_len);
+    sendto(sock, &tx, sizeof(tx), 0, (struct sockaddr *)remoteaddr,
+           remoteaddr_len);
+    // The handshake_state is conceptually in the COOKIE_GENERATED state now,
+    // but the whole point of the cookie is to avoid saving state in the server,
+    // so we don't store a Session here.
+  } else {
+    // Cookie provided, validate it to accept or reject the connection.
+    if (!s->ValidateCookie(rx, remoteaddr, remoteaddr_len)) {
+      return;
+    }
+    fprintf(stderr, "New client connection: %s\n",
+            sockaddr_to_str((struct sockaddr *)remoteaddr));
+    SessionMap::iterator it = s->NewSession(
+        now + 10 * 1000, ntohl(rx->usec_per_pkt), remoteaddr, remoteaddr_len);
+    Session &session = it->second;
+    session.handshake_state = Session::ESTABLISHED;
+    memcpy(&session.rx, rx, sizeof(session.rx));
+    // This is a new session we haven't sent any timing packets on, so the
+    // client can't possibly have acknowledged any packets.  Replace the
+    // handshake data with a set of empty acks and process as normal.
+    session.rx.packet_type = PACKET_TYPE_ACK;
+    memset(&session.rx.data.acks, 0, sizeof(session.rx.data.acks));
+    assert(sizeof(session.rx.data.acks) > sizeof(void *));
+    handle_ack_packet(&session, now);
+  }
+}
+
+void handle_server_handshake_packet(Sessions *s, Packet *rx, uint32_t now) {
+  assert(s != NULL);
+  assert(rx != NULL);
+  assert(s->session_map.size() == 1);
+  assert(s->next_sends.size() == 1);
+
+  SessionMap::iterator it = s->session_map.begin();
+  Session &session = it->second;
+  // We don't need to resend the handshake packet any more.
+  s->next_sends.pop();
+
+  session.tx.packet_type = PACKET_TYPE_HANDSHAKE;
+  session.tx.data.handshake.cookie_epoch = rx->data.handshake.cookie_epoch;
+  memcpy(&session.tx.data.handshake.cookie, &rx->data.handshake.cookie,
+         COOKIE_SIZE);
+  int usec_per_pkt = ntohl(rx->usec_per_pkt);
+  if (usec_per_pkt != session.usec_per_pkt) {
+    fprintf(stderr, "Server overrode packets per second to %f\n",
+            1000000.0 / usec_per_pkt);
+    session.usec_per_pkt = usec_per_pkt;
+  }
+  DLOG("Handshake state: client received cookie from server, moving to "
+       "COOKIE_GENERATED; next_send=%d (was %d)\n",
+       now, session.next_send);
+  DLOG("Handshake: cookie epoch=%d, cookie=0x",
+       rx->data.handshake.cookie_epoch);
+  debug_print_hex(rx->data.handshake.cookie, sizeof(rx->data.handshake.cookie));
+  session.handshake_state = Session::COOKIE_GENERATED;
+  session.next_send = now;
+  s->next_sends.push(it);
+}
+
+void handle_ack_packet(struct Session *s, uint32_t now) {
+  assert(s != NULL);
+  assert(s->rx.packet_type == PACKET_TYPE_ACK);
   // process the incoming packet header.
   // Most of the complexity here comes from the fact that the remote
   // system's clock will be skewed vs. ours.  (We use CLOCK_MONOTONIC
@@ -434,6 +758,8 @@ void handle_packet(struct Session *s, uint32_t now) {
     s->start_rxtime = rxtime - id * s->usec_per_pkt;
   }
   int32_t rxdiff = DIFF(rxtime, s->start_rxtime + id * s->usec_per_pkt);
+  DLOG("ack: rxdiff=%d, rxtime=%u, start_rxtime=%u, id=%d, usec_per_pkt=%d\n",
+       rxdiff, rxtime, s->start_rxtime, id, s->usec_per_pkt);
 
   // Figure out the offset between our clock and the remote's clock, so we can
   // calculate the minimum round trip time (rtt). Then, because the consecutive
@@ -486,6 +812,8 @@ void handle_packet(struct Session *s, uint32_t now) {
     s->lat_rx_sum += s->lat_rx;
     s->lat_rx_var_sum += s->lat_rx * s->lat_rx;
   }
+  DLOG("ack packet: rx id=%d, clockdiff=%d, rtt=%d, offset=%d, rxdiff=%d\n",
+       id, clockdiff, rtt, offset, rxdiff);
 
   // Note: the way ok_to_print is structured, if there is a dropout in the
   // connection for more than usec_per_print, we will statistically end up
@@ -519,24 +847,27 @@ void handle_packet(struct Session *s, uint32_t now) {
   }
 
   // schedule this for an ack next time we send the packet
-  s->tx.acks[s->next_txack_index].id = htonl(id);
-  s->tx.acks[s->next_txack_index].rxtime = htonl(rxtime);
-  s->next_txack_index = (s->next_txack_index + 1) % ARRAY_LEN(s->tx.acks);
+  s->tx.data.acks[s->next_txack_index].id = htonl(id);
+  s->tx.data.acks[s->next_txack_index].rxtime = htonl(rxtime);
+  s->next_txack_index = (s->next_txack_index + 1) % ARRAY_LEN(s->tx.data.acks);
 
   // see which of our own transmitted packets have been acked
-  uint32_t first_ack = ntohl(s->rx.first_ack);
-  for (uint32_t i = 0; i < ARRAY_LEN(s->rx.acks); i++) {
-    uint32_t acki = (first_ack + i) % ARRAY_LEN(s->rx.acks);
-    uint32_t ackid = ntohl(s->rx.acks[acki].id);
+  uint32_t first_ack = s->rx.first_ack;
+  for (uint32_t i = 0; i < ARRAY_LEN(s->rx.data.acks); i++) {
+    uint32_t acki = (first_ack + i) % ARRAY_LEN(s->rx.data.acks);
+    uint32_t ackid = ntohl(s->rx.data.acks[acki].id);
     if (!ackid) continue;  // empty slot
     if (DIFF(ackid, s->next_rxack_id) >= 0) {
       // an expected ack
       uint32_t start_txtime = s->next_send - s->next_tx_id * s->usec_per_pkt;
       uint32_t txtime = start_txtime + ackid * s->usec_per_pkt;
-      uint32_t rrxtime = ntohl(s->rx.acks[acki].rxtime);
+      uint32_t rrxtime = ntohl(s->rx.data.acks[acki].rxtime);
       uint32_t rxtime = rrxtime + offset;
       // note: already contains 1/2 rtt, unlike rxdiff
       int32_t txdiff = DIFF(rxtime, txtime);
+      DLOG("acki=%d ackid=%d txdiff=%d rxtime=%u txtime=%u offset=%u, "
+           "start_txtime=%u\n",
+           acki, ackid, txdiff, rxtime, txtime, offset, start_txtime);
       if (!quiet && s->usec_per_print <= 0 && s->last_ackinfo[0]) {
         // only print multiple acks per rx if no usec_per_print limit
         if (want_timestamps) print_timestamp(rxtime);
@@ -559,7 +890,6 @@ void handle_packet(struct Session *s, uint32_t now) {
 
   s->last_rxtime = rxtime;
 }
-
 
 int isoping_main(int argc, char **argv) {
   struct sockaddr_in6 listenaddr;
@@ -613,6 +943,7 @@ int isoping_main(int argc, char **argv) {
     return 1;
   }
 
+  int is_server;
   uint32_t now = ustime();       // current time
   Sessions sessions;
 
@@ -681,6 +1012,8 @@ int isoping_main(int argc, char **argv) {
   act.sa_flags = SA_RESETHAND;
   sigaction(SIGINT, &act, NULL);
 
+  uint32_t last_secret_update_time = 0;
+
   while (!want_to_die) {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -703,7 +1036,13 @@ int isoping_main(int argc, char **argv) {
       return 1;
     }
 
-    int err = send_waiting_packets(&sessions, sock, now);
+    // Periodically check if the cookie secrets need updating.
+    if (is_server && (now - last_secret_update_time) > 1000000) {
+      sessions.MaybeRotateCookieSecrets();
+      last_secret_update_time = now;
+    }
+
+    int err = send_waiting_packets(&sessions, sock, now, is_server);
     if (err != 0) {
       return err;
     }
