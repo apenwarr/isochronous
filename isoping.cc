@@ -307,6 +307,7 @@ static void usage_and_die(char *argv0) {
           "\n"
           "      -f <lines/sec>  max output lines per second\n"
           "      -r <pps>        packets per second (default=%g)\n"
+          "                      in server mode: the highest accepted rate.\n"
           "      -t <ttl>        packet ttl to use (default=2 for safety)\n"
           "      -q              quiet mode (don't print packets)\n"
           "      -T              print timestamps\n",
@@ -314,6 +315,10 @@ static void usage_and_die(char *argv0) {
   exit(99);
 }
 
+void set_packets_per_sec(double new_pps) {
+  DLOG("Setting packets_per_sec to %f\n", new_pps);
+  packets_per_sec = new_pps;
+}
 
 bool CompareSockaddr::operator()(const struct sockaddr_storage &lhs,
                                  const struct sockaddr_storage &rhs) {
@@ -425,8 +430,8 @@ void prepare_handshake_reply_packet(Packet *tx, Packet *rx, uint32_t now) {
   memset(tx, 0, sizeof(*tx));
   tx->magic = htonl(MAGIC);
   tx->id = rx->id;
-  // TODO(pmccurdy): Establish limits on the allowed usec_per_pkt values here
-  tx->usec_per_pkt = rx->usec_per_pkt;
+  tx->usec_per_pkt = htonl(
+      std::max(ntohl(rx->usec_per_pkt), (uint32_t)(1e6 / packets_per_sec)));
   tx->txtime = now;
   tx->clockdiff = htonl(now - ntohl(rx->txtime));
   tx->num_lost = htonl(0);
@@ -646,6 +651,7 @@ void handle_new_client_handshake_packet(Sessions *s, Packet *rx, int sock,
     }
     fprintf(stderr, "New client connection: %s\n",
             sockaddr_to_str((struct sockaddr *)remoteaddr));
+    // Use the usec_per_pkt value provided by the server.
     SessionMap::iterator it = s->NewSession(
         now + 10 * 1000, ntohl(rx->usec_per_pkt), remoteaddr, remoteaddr_len);
     Session &session = it->second;
@@ -909,7 +915,7 @@ int isoping_main(int argc, char **argv) {
       }
       break;
     case 'r':
-      packets_per_sec = atof(optarg);
+      set_packets_per_sec(atof(optarg));
       if (packets_per_sec < 0.001 || packets_per_sec > 1e6) {
         fprintf(stderr, "%s: packets per sec (-r) must be 0.001..1000000\n",
                 argv[0]);

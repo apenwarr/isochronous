@@ -227,6 +227,9 @@ int send_packet(struct Session *s, int sock, int is_server);
 // currently readable.
 int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server);
 
+// Sets the global packets_per_sec value.  Used for test purposes only.
+void set_packets_per_sec(double new_pps);
+
 // Parses arguments and runs the main loop.  Distinct from main() for unit test
 // purposes.
 int isoping_main(int argc, char **argv);

@@ -616,8 +616,10 @@ WVTEST_MAIN("Send and receive on sockets") {
   WVPASSEQ(read_incoming_packet(&s, ssock, sbase + t, is_server), EINVAL);
 
   // Make a new client, who sends more frequently, getting a new source port.
+  // Also establish an upper limit, to verify that the server enforces it.
   Sessions c2;
-  c2.NewSession(cbase, usec_per_pkt/4, &listenaddr, listenaddr_len);
+  set_packets_per_sec(4e6/usec_per_pkt);
+  c2.NewSession(cbase, usec_per_pkt/10, &listenaddr, listenaddr_len);
   int c2sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
   if (!WVPASS(c2sock > 0)) {
     perror("client socket 2");
@@ -647,6 +649,8 @@ WVTEST_MAIN("Send and receive on sockets") {
   WVPASS(!read_incoming_packet(&s, ssock, sbase+t, is_server));
   t += sc_latency;
   WVPASS(!read_incoming_packet(&c2, c2sock, cbase+t, is_client));
+
+  WVPASSEQ(c2Session.usec_per_pkt, usec_per_pkt/4);
 
   // Now we can send a validated packet to the server.
   t = c2Session.next_send - cbase;
