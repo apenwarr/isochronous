@@ -27,17 +27,17 @@
 
 #include "isoping.h"
 
-uint32_t send_next_ack_packet(Session *from, uint32_t from_base,
-                          Session *to, uint32_t to_base, uint32_t latency) {
-  uint32_t t = from->next_send - from_base;
+uint32_t send_next_ack_packet(Session *from, uint64_t from_base, Session *to,
+                              uint64_t to_base, uint32_t latency) {
+  uint64_t t = from->next_send - from_base;
   prepare_tx_packet(from);
   to->rx = from->tx;
   from->next_send += from->usec_per_pkt;
   t += latency;
   handle_ack_packet(to, to_base + t);
   fprintf(stderr,
-          "**Sent packet: txtime=%d, start_txtime=%d, rxtime=%d, "
-          "start_rxtime=%d, latency=%d, t_from=%d, t_to=%d\n",
+          "**Sent packet: txtime=%ld, start_txtime=%d, rxtime=%lu, "
+          "start_rxtime=%lu, latency=%d, t_from=%lu, t_to=%lu\n",
           from->next_send,
           to->start_rtxtime,
           to_base + t,
@@ -49,15 +49,91 @@ uint32_t send_next_ack_packet(Session *from, uint32_t from_base,
   return t;
 }
 
+// Returns a new socket, connected to the given address.  Returns a negative
+// value on error.
+int create_client_socket(struct sockaddr_storage *listenaddr,
+                         socklen_t listenaddr_len, struct addrinfo *res) {
+  int csock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (!WVPASS(csock >= 0)) {
+    perror("client socket");
+    return -1;
+  }
+  if (!WVPASS(!connect(csock, (struct sockaddr *)listenaddr, listenaddr_len))) {
+    perror("connect");
+    return -1;
+  }
+  struct sockaddr_in6 caddr;
+  socklen_t caddr_len = sizeof(caddr);
+  memset(&caddr, 0, caddr_len);
+  if (!WVPASS(!getsockname(csock, (struct sockaddr *)&caddr, &caddr_len))) {
+    perror("getsockname");
+    return -1;
+  }
+  char buf[128];
+  inet_ntop(AF_INET6, (struct sockaddr *)&caddr, buf, sizeof(buf));
+  printf("Created client connection on %s:%d\n", buf, ntohs(caddr.sin6_port));
+  return csock;
+}
+
+// Creates two sockets and puts them in *csock and *ssock.  *ssock is listening
+// to the given address, and *csock is connected to it.  Returns true on
+// success.
+bool create_local_socketpair(struct sockaddr_storage *listenaddr,
+                             socklen_t listenaddr_len, int *csock, int *ssock,
+                             struct addrinfo **res) {
+  struct addrinfo hints;
+
+  // Get local interface information.
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET6;
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_flags = AI_PASSIVE | AI_V4MAPPED;
+  int err = getaddrinfo(NULL, "0", &hints, res);
+  if (err != 0) {
+    WVPASSEQ("Error from getaddrinfo: ", gai_strerror(err));
+    return false;
+  }
+
+  *ssock = socket((*res)->ai_family, (*res)->ai_socktype, (*res)->ai_protocol);
+  if (!WVPASS(*ssock >= 0)) {
+    perror("server socket");
+    return false;
+  }
+
+  if (!WVPASS(!bind(*ssock, (*res)->ai_addr, (*res)->ai_addrlen))) {
+    perror("bind");
+    return false;
+  }
+
+  // Figure out the local port we got.
+  memset(listenaddr, 0, listenaddr_len);
+  if (!WVPASS(!getsockname(*ssock, (struct sockaddr *)listenaddr,
+                           &listenaddr_len))) {
+    perror("getsockname");
+    return false;
+  }
+
+  printf("Bound server socket to port=%d\n",
+         listenaddr->ss_family == AF_INET
+             ? ntohs(((struct sockaddr_in *)listenaddr)->sin_port)
+             : ntohs(((struct sockaddr_in6 *)listenaddr)->sin6_port));
+
+  *csock = create_client_socket(listenaddr, listenaddr_len, *res);
+  if (*csock < 0) {
+    return false;
+  }
+  return true;
+}
+
 WVTEST_MAIN("isoping algorithm logic") {
   // Establish a positive base time for client and server.  This is conceptually
   // the instant when the client sends its first message to the server, as
   // measured by the clocks on each side (note: this is before the server
   // receives the message).
-  uint32_t cbase = 400 * 1000;
-  uint32_t sbase = 600 * 1000;
-  uint32_t real_clockdiff = sbase - cbase;
-  uint32_t usec_per_pkt = 100 * 1000;
+  uint64_t cbase = 400 * 1000;
+  uint64_t sbase = 600 * 1000;
+  uint64_t real_clockdiff = sbase - cbase;
+  uint64_t usec_per_pkt = 100 * 1000;
 
   // The states of the client and server.
   struct sockaddr_storage empty_sockaddr;
@@ -434,67 +510,13 @@ WVTEST_MAIN("Send and receive on sockets") {
 
   // Sockets for the client and server.
   int ssock, csock;
-  struct addrinfo hints, *res;
-
-  // Get local interface information.
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET6;
-  hints.ai_socktype = SOCK_DGRAM;
-  hints.ai_flags = AI_PASSIVE | AI_V4MAPPED;
-  int err = getaddrinfo(NULL, "0", &hints, &res);
-  if (err != 0) {
-    WVPASSEQ("Error from getaddrinfo: ", gai_strerror(err));
-    return;
-  }
-
-  ssock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (!WVPASS(ssock >= 0)) {
-    perror("server socket");
-    return;
-  }
-
-  csock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (!WVPASS(csock >= 0)) {
-    perror("client socket");
-    return;
-  }
-
-  if (!WVPASS(!bind(ssock, res->ai_addr, res->ai_addrlen))) {
-    perror("bind");
-    return;
-  }
-
-  // Figure out the local port we got.
   struct sockaddr_storage listenaddr;
   socklen_t listenaddr_len = sizeof(listenaddr);
-  memset(&listenaddr, 0, listenaddr_len);
-  if (!WVPASS(!getsockname(ssock, (struct sockaddr *)&listenaddr,
-                           &listenaddr_len))) {
-    perror("getsockname");
+  struct addrinfo *res;
+  if (!create_local_socketpair(&listenaddr, listenaddr_len, &csock, &ssock,
+                               &res)) {
     return;
   }
-
-  printf("Bound server socket to port=%d\n",
-         listenaddr.ss_family == AF_INET
-             ? ntohs(((struct sockaddr_in *)&listenaddr)->sin_port)
-             : ntohs(((struct sockaddr_in6 *)&listenaddr)->sin6_port));
-
-  // Connect the client's socket.
-  if (!WVPASS(
-          !connect(csock, (struct sockaddr *)&listenaddr, listenaddr_len))) {
-    perror("connect");
-    return;
-  }
-  struct sockaddr_in6 caddr;
-  socklen_t caddr_len = sizeof(caddr);
-  memset(&caddr, 0, caddr_len);
-  if (!WVPASS(!getsockname(csock, (struct sockaddr *)&caddr, &caddr_len))) {
-    perror("getsockname");
-    return;
-  }
-  char buf[128];
-  inet_ntop(AF_INET6, (struct sockaddr *)&caddr, buf, sizeof(buf));
-  printf("Created client connection on %s:%d\n", buf, ntohs(caddr.sin6_port));
 
   // All active sessions for the client and server.
   Sessions c;
@@ -539,7 +561,7 @@ WVTEST_MAIN("Send and receive on sockets") {
   WVPASS(!send_waiting_packets(&c, csock, cbase + t, is_client));
   FD_ZERO(&rfds);
   FD_SET(csock, &rfds);
-  nfds = select(csock + 1, &rfds, NULL, NULL, &tv);
+  nfds = select(ssock + 1, &rfds, NULL, NULL, &tv);
   WVPASSEQ(nfds, 0);
 
   // Wait for the client to time out and resend the initial handshake packet.
@@ -620,26 +642,7 @@ WVTEST_MAIN("Send and receive on sockets") {
   Sessions c2;
   set_packets_per_sec(4e6/usec_per_pkt);
   c2.NewSession(cbase, usec_per_pkt/10, &listenaddr, listenaddr_len);
-  int c2sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (!WVPASS(c2sock > 0)) {
-    perror("client socket 2");
-    return;
-  }
-  if (!WVPASS(
-          !connect(c2sock, (struct sockaddr *)&listenaddr, listenaddr_len))) {
-    perror("connect");
-    return;
-  }
-  struct sockaddr_in6 c2addr;
-  socklen_t c2addr_len = sizeof(c2addr);
-  memset(&c2addr, 0, c2addr_len);
-  if (!WVPASS(!getsockname(c2sock, (struct sockaddr *)&c2addr, &c2addr_len))) {
-    perror("getsockname");
-    return;
-  }
-  inet_ntop(AF_INET6, (struct sockaddr *)&c2addr, buf, sizeof(buf));
-  printf("Created new client connection on %s:%d\n", buf,
-         ntohs(c2addr.sin6_port));
+  int c2sock = create_client_socket(&listenaddr, listenaddr_len, res);
 
   Session &c2Session = c2.session_map.begin()->second;
   // Perform the handshake dance so the server knows we're legit.
@@ -851,5 +854,121 @@ WVTEST_MAIN("Exponential Handshake Backoff") {
 
   // Cleanup
   close(sock);
+  freeaddrinfo(res);
+}
+
+WVTEST_MAIN("sending packets when time rolls over 32 bits") {
+  // Have the server's time be close to rolling over the 32-bit microsecond
+  // boundary.
+  uint32_t usec_per_pkt = 100 * 1000;
+  uint64_t cbase = 400 * 1000;
+  uint64_t wrap = 1ull << 32;
+  // It takes one round-trip to establish the handshake
+  uint64_t sbase = wrap - 1.5 * usec_per_pkt;
+
+  // Sockets for the clients and server.
+  int ssock, csock;
+  struct sockaddr_storage listenaddr;
+  socklen_t listenaddr_len = sizeof(listenaddr);
+  struct addrinfo *res;
+  if (!create_local_socketpair(&listenaddr, listenaddr_len, &csock, &ssock,
+                               &res)) {
+    return;
+  }
+
+  int c2sock = create_client_socket(&listenaddr, listenaddr_len, res);
+
+  // All active sessions for the clients and server.
+  Sessions s;
+  Sessions c;
+  Sessions c2;
+
+  int is_server = 1;
+  int is_client = 0;
+
+  s.MaybeRotateCookieSecrets(sbase, is_server);
+  // The first session sends slowly, the second one sends more frequently.
+  c.NewSession(cbase, 4 * usec_per_pkt, &listenaddr, listenaddr_len);
+  c2.NewSession(cbase, usec_per_pkt, &listenaddr, listenaddr_len);
+
+  // Send the initial handshake packets.
+  Session &cSession = c.session_map.begin()->second;
+  uint64_t t = cSession.next_send - cbase;
+  WVPASS(!send_waiting_packets(&c, csock, cbase + t, is_client));
+
+  //Session &c2Session = c2.session_map.begin()->second;
+  WVPASS(!send_waiting_packets(&c2, c2sock, cbase + t, is_client));
+
+  // The server sends the handshake response immediately.
+  WVPASS(!read_incoming_packet(&s, ssock, sbase, is_server));
+  WVPASS(!read_incoming_packet(&s, ssock, sbase, is_server));
+
+  // Finish the handshake.
+  WVPASS(!read_incoming_packet(&c, csock, cbase + t, is_client));
+  WVPASS(!read_incoming_packet(&c2, c2sock, cbase + t, is_client));
+  t = cSession.next_send - cbase;
+  WVPASS(!send_waiting_packets(&c, csock, cbase + t, is_client));
+  WVPASS(!send_waiting_packets(&c2, c2sock, cbase + t, is_client));
+
+  // Receive the full handshake packets at a time where the fast client can
+  // still send before the time wraps, but the slow client will exceed 32 bits.
+  t = wrap - 2 * usec_per_pkt - sbase;
+  WVPASS(!read_incoming_packet(&s, ssock, sbase + t, is_server));
+  WVPASS(!read_incoming_packet(&s, ssock, sbase + t, is_server));
+
+  WVPASSEQ(s.session_map.size(), 2);
+
+  Session &sSession = s.session_map.begin()->second;
+  t += usec_per_pkt;
+  printf("Finishing handshake: next_send_time=%lu (0x%lx)\n",
+         s.next_send_time(), s.next_send_time());
+  printf("last_rxtime: %d\n", sSession.last_rxtime);
+  printf("min_cycle_rxdiff: %d\n", sSession.min_cycle_rxdiff);
+  WVPASS(s.next_send_time() < wrap);
+  WVPASS(!send_waiting_packets(&s, ssock, sbase + t, is_server));
+  printf("Finished handshake, next_send_time=%lu (0x%lx)\n",
+         s.next_send_time(), s.next_send_time());
+  // The fast client still needs to send before we wrap.
+  WVPASS(s.next_send_time() < wrap);
+
+  // Verify we don't spuriously send any packets.
+  WVPASS(!read_incoming_packet(&c, csock, cbase + t, is_client));
+  WVPASS(!read_incoming_packet(&c2, c2sock, cbase + t, is_client));
+  WVPASS(!send_waiting_packets(&s, ssock, sbase + t, is_server));
+
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(csock, &rfds);
+  FD_SET(c2sock, &rfds);
+  struct timeval tv = {0, 0};
+  int nfds = select(std::max(csock, c2sock) + 1, &rfds, NULL, NULL, &tv);
+  WVPASSEQ(nfds, 0);
+
+  // Verify that we still send pre-wrap-scheduled packets before the server's
+  // time actually wraps.
+  t = wrap - 1 - sbase;
+  WVPASS(!send_waiting_packets(&s, ssock, sbase + t, is_server));
+  WVPASS(wrap < s.next_send_time());
+
+  FD_ZERO(&rfds);
+  FD_SET(c2sock, &rfds);
+  nfds = select(std::max(csock, c2sock) + 1, &rfds, NULL, NULL, &tv);
+  WVPASSEQ(nfds, 1);
+  WVPASS(!read_incoming_packet(&c2, c2sock, cbase + t, is_client));
+
+  // Verify we can still send packets after crossing the 32-bit boundary.
+  t = s.next_send_time() - sbase;
+  WVPASS(!send_waiting_packets(&s, ssock, sbase + t, is_server));
+
+  FD_ZERO(&rfds);
+  FD_SET(c2sock, &rfds);
+  nfds = select(std::max(csock, c2sock) + 1, &rfds, NULL, NULL, &tv);
+  WVPASSEQ(nfds, 1);
+  WVPASS(!read_incoming_packet(&c2, c2sock, cbase + t, is_client));
+
+  // Cleanup
+  close(ssock);
+  close(csock);
+  close(c2sock);
   freeaddrinfo(res);
 }

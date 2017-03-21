@@ -63,6 +63,7 @@
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define DIFF(x, y) ((int32_t)((uint32_t)(x) - (uint32_t)(y)))
+#define DIFF64(x, y) ((int64_t)((uint64_t)(x) - (uint64_t)(y)))
 #define DIV(x, y) ((y) ? ((double)(x)/(y)) : 0)
 #define _STR(n) #n
 #define STR(n) _STR(n)
@@ -120,7 +121,7 @@ static void debug_print_hex(unsigned char *data, size_t data_len) {
   DLOG("\n");
 }
 
-Session::Session(uint32_t first_send, uint32_t usec_per_pkt,
+Session::Session(uint64_t first_send, uint32_t usec_per_pkt,
                  const struct sockaddr_storage &raddr, size_t raddr_len)
     : usec_per_pkt(usec_per_pkt),
       usec_per_print(prints_per_sec > 0 ? 1e6 / prints_per_sec : 0),
@@ -149,7 +150,7 @@ Session::Session(uint32_t first_send, uint32_t usec_per_pkt,
   DLOG("Handshake state: NEW_SESSION\n");
 }
 
-SessionMap::iterator Sessions::NewSession(uint32_t first_send,
+SessionMap::iterator Sessions::NewSession(uint64_t first_send,
                                           uint32_t usec_per_pkt,
                                           struct sockaddr_storage *addr,
                                           socklen_t addr_len) {
@@ -242,7 +243,7 @@ bool Sessions::ValidateCookie(Packet *p, struct sockaddr_storage *addr,
   return true;
 }
 
-void Sessions::MaybeRotateCookieSecrets(uint32_t now, int is_server) {
+void Sessions::MaybeRotateCookieSecrets(uint64_t now, int is_server) {
   if (is_server && (now - last_secret_update_time) > 1000000) {
     // Round off the unix timestamp to 64 seconds as an epoch, so we don't have
     // to track which ones we've already used.
@@ -272,11 +273,9 @@ void Sessions::NewRandomCookieSecret() {
   DLOG("Generated new cookie secret.\n");
 }
 
-// Returns the kernel monotonic timestamp in microseconds, truncated to
-// 32 bits.  That will wrap around every ~4000 seconds, which is okay
-// for our purposes.  We use 32 bits to save space in our packets.
-// This function never returns the value 0; it returns 1 instead, so that
-// 0 can be used as a magic value.
+// Returns the kernel monotonic timestamp in microseconds.  This function never
+// returns the value 0; it returns 1 instead, so that 0 can be used as a magic
+// value.
 #ifdef __MACH__  // MacOS X doesn't have clock_gettime()
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -308,11 +307,6 @@ static uint64_t ustime64(void) {
   return !result ? 1 : result;
 }
 #endif
-
-
-static uint32_t ustime(void) {
-  return (uint32_t)ustime64();
-}
 
 
 static void usage_and_die(char *argv0) {
@@ -368,16 +362,13 @@ bool CompareNextSend::operator()(const SessionMap::iterator &lhs,
 // Print the timestamp corresponding to the current time.
 // Deliberately the same format as tcpdump uses, so we can easily sort and
 // correlate messages between isoping and tcpdump.
-static void print_timestamp(uint32_t when) {
-  uint64_t now = ustime64();
-  int32_t nowdiff = DIFF(now, when);
-  uint64_t when64 = now - nowdiff;
-  time_t t = when64 / 1000000;
+static void print_timestamp(uint64_t when) {
+  time_t t = when / 1000000;
   struct tm tm;
   memset(&tm, 0, sizeof(tm));
   localtime_r(&t, &tm);
   printf("%02d:%02d:%02d.%06d ", tm.tm_hour, tm.tm_min, tm.tm_sec,
-         (int)(when64 % 1000000));
+         (int)(when % 1000000));
 }
 
 
@@ -442,14 +433,14 @@ void prepare_tx_packet(struct Session *s) {
 }
 
 
-void prepare_handshake_reply_packet(Packet *tx, Packet *rx, uint32_t now) {
+void prepare_handshake_reply_packet(Packet *tx, Packet *rx, uint64_t now) {
   memset(tx, 0, sizeof(*tx));
   tx->magic = htonl(MAGIC);
   tx->id = rx->id;
   tx->usec_per_pkt = htonl(
       std::max(ntohl(rx->usec_per_pkt), (uint32_t)(1e6 / packets_per_sec)));
-  tx->txtime = now;
-  tx->clockdiff = htonl(now - ntohl(rx->txtime));
+  tx->txtime = (uint32_t)now;
+  tx->clockdiff = htonl((uint32_t)now - ntohl(rx->txtime));
   tx->num_lost = htonl(0);
   tx->packet_type = PACKET_TYPE_HANDSHAKE;
 }
@@ -462,7 +453,8 @@ int send_packet(struct Session *s, int sock, int is_server) {
       perror("sendto");
     }
   } else {
-    DLOG("Calling send on socket %d, size=%ld\n", sock, sizeof(s->tx));
+    DLOG("Calling send on socket %d, size=%ld, is_server=%d\n", sock,
+         sizeof(s->tx), is_server);
     if (send(sock, &s->tx, sizeof(s->tx), 0) < 0) {
       int e = errno;
       perror("send");
@@ -472,7 +464,7 @@ int send_packet(struct Session *s, int sock, int is_server) {
   if (is_server ||
       s->handshake_state == Session::ESTABLISHED ||
       s->handshake_state == Session::COOKIE_GENERATED) {
-    DLOG("send_packet: ack packet, next_send in %d (from %d to %d)\n",
+    DLOG("send_packet: ack packet, next_send in %d (from %ld to %ld)\n",
          s->usec_per_pkt, s->next_send, s->next_send + s->usec_per_pkt);
     s->next_send += s->usec_per_pkt;
   } else {
@@ -490,9 +482,10 @@ int send_packet(struct Session *s, int sock, int is_server) {
     // Limit the backoff to a factor of 2^10.
     uint32_t timeout = Session::handshake_timeout_usec *
                        (1 << std::min(10, s->handshake_retry_count));
-    DLOG("Sending handshake, retries=%d, next_send in %d us (from %u to %u)\n",
-         s->handshake_retry_count, timeout, s->next_send,
-         s->next_send + timeout);
+    DLOG(
+        "Sending handshake, retries=%d, next_send in %d us (from %lu to %lu)\n",
+        s->handshake_retry_count, timeout, s->next_send,
+        s->next_send + timeout);
     s->next_send += timeout;
     // Don't count the handshake packet as part of the sequence.
     s->next_tx_id--;
@@ -500,18 +493,19 @@ int send_packet(struct Session *s, int sock, int is_server) {
   return 0;
 }
 
-int send_waiting_packets(Sessions *sessions, int sock, uint32_t now,
+int send_waiting_packets(Sessions *sessions, int sock, uint64_t now,
                          int is_server) {
   if (sessions == NULL) {
     return -1;
   }
-  // TODO(pmccurdy): This will incorrectly send packets too early during the
-  // time period where now + usec_per_pkt wraps around, i.e. about once per 71
-  // minutes, and will end up blasting packets as fast as possible for that
-  // duration.  Consider calculating next_send and now as 64-bit values, and
-  // truncating to 32 bits when transmitting.
+  DLOG("send_waiting_packets: %ld waiting, now=%lu (0x%lx), "
+       "next send time=%ld, diff=%ld\n",
+       sessions->next_sends.size(), now, now, sessions->next_send_time(),
+       DIFF64(now, sessions->next_send_time()));
   while (sessions->next_sends.size() > 0 &&
-         DIFF(now, sessions->next_send_time()) >= 0) {
+         DIFF64(now, sessions->next_send_time()) >= 0) {
+    DLOG("%ld waiting packets, now=%ld, next send time=%ld\n",
+         sessions->next_sends.size(), now, sessions->next_send_time());
     SessionMap::iterator it = sessions->next_sends.top();
     sessions->next_sends.pop();
     Session &s = it->second;
@@ -539,7 +533,7 @@ int send_waiting_packets(Sessions *sessions, int sock, uint32_t now,
   return 0;
 }
 
-int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server) {
+int read_incoming_packet(Sessions *s, int sock, uint64_t now, int is_server) {
   struct sockaddr_storage rxaddr;
   socklen_t rxaddr_len = sizeof(rxaddr);
 
@@ -603,7 +597,7 @@ int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server) {
 // connection.
 void handle_packet(struct Sessions *s, struct Session *session, Packet *rx,
                    int sock, struct sockaddr_storage *rxaddr,
-                   socklen_t rxaddr_len, uint32_t now, int is_server) {
+                   socklen_t rxaddr_len, uint64_t now, int is_server) {
   switch (rx->packet_type) {
     case PACKET_TYPE_HANDSHAKE:
       if (is_server) {
@@ -624,7 +618,7 @@ void handle_packet(struct Sessions *s, struct Session *session, Packet *rx,
           // Now we know the server has accepted our connection.  Clear out the
           // handshake data from the send buffer and prepare to track acks.
           DLOG("Ack from server on new connection; moving to state "
-               "ESTABLISHED.");
+               "ESTABLISHED.\n");
           session->handshake_state = Session::ESTABLISHED;
           memset(&session->tx.data.acks, 0, sizeof(session->tx.data.acks));
         }
@@ -640,7 +634,7 @@ void handle_packet(struct Sessions *s, struct Session *session, Packet *rx,
 
 void handle_new_client_handshake_packet(Sessions *s, Packet *rx, int sock,
                                        struct sockaddr_storage *remoteaddr,
-                                       size_t remoteaddr_len, uint32_t now) {
+                                       size_t remoteaddr_len, uint64_t now) {
   assert(s != NULL);
   assert(rx != NULL);
   assert(remoteaddr != NULL);
@@ -683,7 +677,7 @@ void handle_new_client_handshake_packet(Sessions *s, Packet *rx, int sock,
   }
 }
 
-void handle_server_handshake_packet(Sessions *s, Packet *rx, uint32_t now) {
+void handle_server_handshake_packet(Sessions *s, Packet *rx, uint64_t now) {
   assert(s != NULL);
   assert(rx != NULL);
   assert(s->session_map.size() == 1);
@@ -705,7 +699,7 @@ void handle_server_handshake_packet(Sessions *s, Packet *rx, uint32_t now) {
     session.usec_per_pkt = usec_per_pkt;
   }
   DLOG("Handshake state: client received cookie from server, moving to "
-       "COOKIE_GENERATED; next_send=%d (was %d)\n",
+       "COOKIE_GENERATED; next_send=%ld (was %ld)\n",
        now, session.next_send);
   DLOG("Handshake: cookie epoch=%d, cookie=0x",
        rx->data.handshake.cookie_epoch);
@@ -715,7 +709,7 @@ void handle_server_handshake_packet(Sessions *s, Packet *rx, uint32_t now) {
   s->next_sends.push(it);
 }
 
-void handle_ack_packet(struct Session *s, uint32_t now) {
+void handle_ack_packet(struct Session *s, uint64_t now) {
   assert(s != NULL);
   assert(s->rx.packet_type == PACKET_TYPE_ACK);
   // process the incoming packet header.
@@ -727,7 +721,8 @@ void handle_ack_packet(struct Session *s, uint32_t now) {
   // tick... except for inevitable clock rate errors, which we have to
   // account for occasionally.
 
-  uint32_t txtime = ntohl(s->rx.txtime), rxtime = now;
+  uint32_t txtime = ntohl(s->rx.txtime);
+  uint64_t rxtime = now;
   uint32_t id = ntohl(s->rx.id);
   if (!s->next_rx_id) {
     // The remote txtime is told to us by the sender, so it is always perfectly
@@ -770,7 +765,7 @@ void handle_ack_packet(struct Session *s, uint32_t now) {
   }
 
   // fix up the clock offset if there's any drift.
-  tmpdiff = DIFF(rxtime, s->start_rxtime + id * s->usec_per_pkt);
+  tmpdiff = DIFF64(rxtime, s->start_rxtime + id * s->usec_per_pkt);
   if (tmpdiff < -20) {
     // packet arrived before predicted time, so prediction was based on
     // a packet that was "slow" before, or else one of our clocks is
@@ -779,8 +774,8 @@ void handle_ack_packet(struct Session *s, uint32_t now) {
             (long)tmpdiff);
     s->start_rxtime = rxtime - id * s->usec_per_pkt;
   }
-  int32_t rxdiff = DIFF(rxtime, s->start_rxtime + id * s->usec_per_pkt);
-  DLOG("ack: rxdiff=%d, rxtime=%u, start_rxtime=%u, id=%d, usec_per_pkt=%d\n",
+  int32_t rxdiff = DIFF64(rxtime, s->start_rxtime + id * s->usec_per_pkt);
+  DLOG("ack: rxdiff=%d, rxtime=%lu, start_rxtime=%lu, id=%d, usec_per_pkt=%d\n",
        rxdiff, rxtime, s->start_rxtime, id, s->usec_per_pkt);
 
   // Figure out the offset between our clock and the remote's clock, so we can
@@ -967,7 +962,7 @@ int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock) {
   }
 
   int is_server;
-  uint32_t now = ustime();       // current time
+  uint64_t now = ustime64();     // current time
 
   if (argc - optind == 0) {
     is_server = 1;
@@ -1045,7 +1040,7 @@ int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock) {
     struct timeval tv;
     tv.tv_sec = 0;
 
-    now = ustime();
+    now = ustime64();
     if (sessions->next_sends.size() == 0 ||
         DIFF(sessions->next_send_time(), now) < 0 ||
         extrasock > 0) {
@@ -1058,7 +1053,7 @@ int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock) {
       tvp = &tv;
     }
     int nfds = select(std::max(sock, extrasock) + 1, &rfds, NULL, NULL, tvp);
-    now = ustime();
+    now = ustime64();
     if (nfds < 0 && errno != EINTR) {
       perror("select");
       return 1;

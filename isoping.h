@@ -66,7 +66,7 @@ struct Packet {
 
 // Data we track per session.
 struct Session {
-  Session(uint32_t first_send, uint32_t usec_per_pkt,
+  Session(uint64_t first_send, uint32_t usec_per_pkt,
           const struct sockaddr_storage &remoteaddr, size_t remoteaddr_len);
   int32_t usec_per_pkt;
   int32_t usec_per_print;
@@ -94,11 +94,11 @@ struct Session {
   uint32_t next_rx_id;       // expected id field for next receive
   uint32_t next_rxack_id;    // expected ack.id field in next received ack
   uint32_t start_rtxtime;    // remote's txtime at startup
-  uint32_t start_rxtime;     // local rxtime at startup
+  uint64_t start_rxtime;     // local rxtime at startup
   uint32_t last_rxtime;      // local rxtime of last received packet
   int32_t min_cycle_rxdiff;  // smallest packet delay seen this cycle
   uint32_t next_cycle;       // time when next cycle begins
-  uint32_t next_send;        // time when we'll send next pkt
+  uint64_t next_send;        // time when we'll send next pkt
   uint32_t num_lost;         // number of rx packets not received
   int next_txack_index;      // next array item to fill in tx.acks
   struct Packet tx, rx;      // transmit and received packet buffers
@@ -134,7 +134,7 @@ class Sessions {
   ~Sessions();
 
   // Rotates the cookie secrets if they haven't been changed in a while.
-  virtual void MaybeRotateCookieSecrets(uint32_t now, int is_server);
+  virtual void MaybeRotateCookieSecrets(uint64_t now, int is_server);
 
   // Rotate the cookie secrets using the given epoch directly.  Only for use in
   // unit tests.
@@ -150,12 +150,12 @@ class Sessions {
   virtual bool ValidateCookie(Packet *p, struct sockaddr_storage *addr,
                               socklen_t addr_len);
 
-  SessionMap::iterator NewSession(uint32_t first_send,
+  SessionMap::iterator NewSession(uint64_t first_send,
                                   uint32_t usec_per_pkt,
                                   struct sockaddr_storage *addr,
                                   socklen_t addr_len);
 
-  uint32_t next_send_time() {
+  uint64_t next_send_time() {
     if (next_sends.size() == 0) {
       return 0;
     }
@@ -189,35 +189,35 @@ class Sessions {
 // Process an incoming packet from the socket.
 void handle_packet(struct Sessions *s, struct Session *session, Packet *rx,
                    int sock, struct sockaddr_storage *rxaddr,
-                   socklen_t rxaddr_len, uint32_t now, int is_server);
+                   socklen_t rxaddr_len, uint64_t now, int is_server);
 
 // Process an established Session's incoming ack packet, from s->rx.
-void handle_ack_packet(struct Session *s, uint32_t now);
+void handle_ack_packet(struct Session *s, uint64_t now);
 
 // Server-only: processes a handshake packet from a new client in rx. Replies
 // with a cookie if no cookie provided, or validates the provided cookie and
 // establishes a new Session.
 void handle_new_client_handshake_packet(Sessions *s, Packet *rx, int sock,
                                        struct sockaddr_storage *remoteaddr,
-                                       size_t remoteaddr_len, uint32_t now);
+                                       size_t remoteaddr_len, uint64_t now);
 
 // Client-only: processes a handshake packet received from the server.
 // Configures the Session to echo the provided cookie back to the server.
-void handle_server_handshake_packet(Sessions *s, Packet *rx, uint32_t now);
+void handle_server_handshake_packet(Sessions *s, Packet *rx, uint64_t now);
 
 // Sets all the elements of s->tx to be ready to be sent to the other side.
 void prepare_tx_packet(struct Session *s);
 
 // Sends a packet to all waiting sessions where the appropriate amount of time
 // has passed.
-int send_waiting_packets(Sessions *s, int sock, uint32_t now, int is_server);
+int send_waiting_packets(Sessions *s, int sock, uint64_t now, int is_server);
 
 // Sends a packet from the given session to the given socket immediately.
 int send_packet(struct Session *s, int sock, int is_server);
 
 // Reads a packet from sock and stores it in s->rx.  Assumes a packet is
 // currently readable.
-int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server);
+int read_incoming_packet(Sessions *s, int sock, uint64_t now, int is_server);
 
 // Sets the global packets_per_sec value.  Used for test purposes only.
 void set_packets_per_sec(double new_pps);
