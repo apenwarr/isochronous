@@ -668,6 +668,44 @@ WVTEST_MAIN("Send and receive on sockets") {
   WVPASSEQ(s.next_sends.size(), 2);
   WVPASSEQ(s.next_send_time(), sbase + t + 10 * 1000);
 
+  // Let the client time out on the server side, then come back.
+  t += 65 * 1000 * 1000;
+  WVPASS(!send_waiting_packets(&s, ssock, sbase + t, is_server));
+  WVPASSEQ(s.session_map.size(), 0);
+  WVPASSEQ(s.next_sends.size(), 0);
+  WVPASSEQ(s.next_send_time(), 0);
+
+  WVPASS(!read_incoming_packet(&c, csock, cbase + t, is_client));
+  // Hack so the client doesn't spam the server catching up.
+  cSession.usec_per_pkt = 50 * 1000 * 1000;
+  WVPASS(!send_waiting_packets(&c, csock, cbase + t, is_client));
+  WVPASSEQ(read_incoming_packet(&s, ssock, sbase + t, is_server), -1);
+  WVPASSEQ(read_incoming_packet(&s, ssock, sbase + t, is_server), -1);
+
+  // The client will immediately receive a handshake packet.
+  FD_ZERO(&rfds);
+  FD_SET(csock, &rfds);
+  nfds = select(csock + 1, &rfds, NULL, NULL, &tv);
+  WVPASSEQ(nfds, 1);
+
+  // The server doesn't store any data for the client yet.
+  WVPASSEQ(s.session_map.size(), 0);
+  WVPASSEQ(s.next_sends.size(), 0);
+  WVPASSEQ(s.next_send_time(), 0);
+
+  // Once the client replies, the session is fully established again.
+  WVPASS(!read_incoming_packet(&c, csock, cbase + t, is_client));
+  t = cSession.next_send;
+  WVPASS(!send_waiting_packets(&c, csock, cbase + t, is_client));
+  WVPASS(!read_incoming_packet(&s, ssock, sbase + t, is_server));
+
+  WVPASSEQ(s.session_map.size(), 1);
+  WVPASSEQ(s.next_sends.size(), 1);
+  WVPASSEQ(s.next_send_time(), sbase + t + 10 * 1000);
+  WVPASSEQ(cSession.next_tx_id, sSession.next_rx_id);
+  WVPASSEQ(cSession.next_rx_id, 0);
+  WVPASSEQ(sSession.next_tx_id, 1);
+
   // Cleanup
   close(ssock);
   close(csock);

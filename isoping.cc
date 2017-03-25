@@ -273,9 +273,10 @@ void Sessions::NewRandomCookieSecret() {
   DLOG("Generated new cookie secret.\n");
 }
 
-// Returns the kernel monotonic timestamp in microseconds.  This function never
-// returns the value 0; it returns 1 instead, so that 0 can be used as a magic
-// value.
+// Returns the kernel monotonic timestamp in microseconds.  We provide 64 bits
+// of data here, though we truncate to 32 on the wire to save space in our
+// packets.  This function never returns the value 0; it returns 1 instead, so
+// that 0 can be used as a magic value.
 #ifdef __MACH__  // MacOS X doesn't have clock_gettime()
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -446,6 +447,18 @@ void prepare_handshake_reply_packet(Packet *tx, Packet *rx, uint64_t now) {
 }
 
 
+void send_initial_handshake_reply(Sessions *s, Packet *rx, int sock,
+                                  struct sockaddr_storage *remoteaddr,
+                                  size_t remoteaddr_len, uint64_t now) {
+  Packet tx;
+  memset(&tx, 0, sizeof(tx));
+  prepare_handshake_reply_packet(&tx, rx, now);
+  s->CalculateCookie(&tx, remoteaddr, remoteaddr_len);
+  sendto(sock, &tx, sizeof(tx), 0, (struct sockaddr *)remoteaddr,
+         remoteaddr_len);
+}
+
+
 int send_packet(struct Session *s, int sock, int is_server) {
   if (is_server) {
     if (sendto(sock, &s->tx, sizeof(s->tx), 0,
@@ -569,10 +582,12 @@ int read_incoming_packet(Sessions *s, int sock, uint64_t now, int is_server) {
       // Note: we don't want to allocate any memory here until the client has
       // completed the handshake.
       if (rx.packet_type != PACKET_TYPE_HANDSHAKE) {
-        fprintf(stderr, "Received non-handshake packet from unknown client\n");
-        // TODO(pmccurdy): Reply with a new handshake packet, including a
-        // cookie; we may have dropped a legit client and we need to tell them
-        // to renegotiate.
+        fprintf(stderr,
+                "Received non-handshake packet from unknown client %s\n",
+                sockaddr_to_str((struct sockaddr *)&rxaddr));
+        // Reply with a new handshake packet, including a cookie; we may have
+        // dropped a legit client and we need to tell them to renegotiate.
+        send_initial_handshake_reply(s, &rx, sock, &rxaddr, rxaddr_len, now);
         return -1;
       }
     }
@@ -605,7 +620,6 @@ void handle_packet(struct Sessions *s, struct Session *session, Packet *rx,
                                            now);
         return;
       } else {
-        DLOG("Client received handshake packet from server\n");
         handle_server_handshake_packet(s, rx, now);
         return;
       }
@@ -645,12 +659,7 @@ void handle_new_client_handshake_packet(Sessions *s, Packet *rx, int sock,
     s->session_map.erase(*remoteaddr);
     fprintf(stderr, "New connection from %s, sending cookie\n",
             sockaddr_to_str((struct sockaddr *)remoteaddr));
-    Packet tx;
-    memset(&tx, 0, sizeof(tx));
-    prepare_handshake_reply_packet(&tx, rx, now);
-    s->CalculateCookie(&tx, remoteaddr, remoteaddr_len);
-    sendto(sock, &tx, sizeof(tx), 0, (struct sockaddr *)remoteaddr,
-           remoteaddr_len);
+    send_initial_handshake_reply(s, rx, sock, remoteaddr, remoteaddr_len, now);
     // The handshake_state is conceptually in the COOKIE_GENERATED state now,
     // but the whole point of the cookie is to avoid saving state in the server,
     // so we don't store a Session here.
@@ -688,6 +697,8 @@ void handle_server_handshake_packet(Sessions *s, Packet *rx, uint64_t now) {
   // We don't need to resend the handshake packet any more.
   s->next_sends.pop();
 
+  session.next_tx_id = 1;
+  session.next_rx_id = 0;
   session.tx.packet_type = PACKET_TYPE_HANDSHAKE;
   session.tx.data.handshake.cookie_epoch = rx->data.handshake.cookie_epoch;
   memcpy(&session.tx.data.handshake.cookie, &rx->data.handshake.cookie,
