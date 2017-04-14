@@ -128,22 +128,13 @@ struct CompareNextSend {
                   const SessionMap::iterator &rhs);
 };
 
-struct Sessions {
+class Sessions {
  public:
-  Sessions()
-      : md(EVP_sha256()),
-        rng(std::random_device()()),
-        cookie_epoch(0) {
-    NewRandomCookieSecret();
-    EVP_MD_CTX_init(&digest_context);
-  }
-
-  ~Sessions() {
-    EVP_MD_CTX_cleanup(&digest_context);
-  }
+  Sessions();
+  ~Sessions();
 
   // Rotates the cookie secrets if they haven't been changed in a while.
-  void MaybeRotateCookieSecrets();
+  virtual void MaybeRotateCookieSecrets(uint32_t now, int is_server);
 
   // Rotate the cookie secrets using the given epoch directly.  Only for use in
   // unit tests.
@@ -156,8 +147,8 @@ struct Sessions {
                        size_t remoteaddr_len);
 
   // Returns true if the packet contains a handshake packet with a valid cookie.
-  bool ValidateCookie(Packet *p, struct sockaddr_storage *addr,
-                      socklen_t addr_len);
+  virtual bool ValidateCookie(Packet *p, struct sockaddr_storage *addr,
+                              socklen_t addr_len);
 
   SessionMap::iterator NewSession(uint32_t first_send,
                                   uint32_t usec_per_pkt,
@@ -178,7 +169,7 @@ struct Sessions {
   std::priority_queue<SessionMap::iterator, std::vector<SessionMap::iterator>,
       CompareNextSend> next_sends;
 
- private:
+ protected:
   void NewRandomCookieSecret();
   bool CalculateCookieWithSecret(Packet *p, struct sockaddr_storage *remoteaddr,
                                  size_t remoteaddr_len, unsigned char *secret,
@@ -189,6 +180,7 @@ struct Sessions {
   const EVP_MD *md;
   std::mt19937_64 rng;
   uint32_t cookie_epoch;
+  uint32_t last_secret_update_time;
   unsigned char cookie_secret[COOKIE_SECRET_SIZE];
   uint32_t prev_cookie_epoch;
   unsigned char prev_cookie_secret[COOKIE_SECRET_SIZE];
@@ -231,7 +223,8 @@ int read_incoming_packet(Sessions *s, int sock, uint32_t now, int is_server);
 void set_packets_per_sec(double new_pps);
 
 // Parses arguments and runs the main loop.  Distinct from main() for unit test
-// purposes.
-int isoping_main(int argc, char **argv);
+// and fuzz test purposes.  extrasock is an additional socket to read from, used
+// for tests.  Set to -1 if unused.
+int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock);
 
 #endif

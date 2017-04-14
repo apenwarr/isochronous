@@ -501,12 +501,12 @@ WVTEST_MAIN("Send and receive on sockets") {
   Sessions s;
   uint32_t usec_per_pkt = 100 * 1000;
 
-  s.MaybeRotateCookieSecrets();
-  // TODO(pmccurdy): Remove +1?
-  c.NewSession(cbase + 1, usec_per_pkt, &listenaddr, listenaddr_len);
-
   int is_server = 1;
   int is_client = 0;
+
+  s.MaybeRotateCookieSecrets(sbase, is_server);
+  // TODO(pmccurdy): Remove +1?
+  c.NewSession(cbase + 1, usec_per_pkt, &listenaddr, listenaddr_len);
 
   // Send the initial handshake packet.
   Session &cSession = c.session_map.begin()->second;

@@ -159,6 +159,19 @@ SessionMap::iterator Sessions::NewSession(uint32_t first_send,
   return p.first;
 }
 
+Sessions::Sessions()
+    : md(EVP_sha256()),
+      rng(std::random_device()()),
+      cookie_epoch(0),
+      last_secret_update_time(0) {
+  NewRandomCookieSecret();
+  EVP_MD_CTX_init(&digest_context);
+}
+
+Sessions::~Sessions() {
+  EVP_MD_CTX_cleanup(&digest_context);
+}
+
 bool Sessions::CalculateCookie(Packet *p, struct sockaddr_storage *remoteaddr,
                                size_t remoteaddr_len) {
   return CalculateCookieWithSecret(p, remoteaddr, remoteaddr_len,
@@ -206,13 +219,13 @@ bool Sessions::ValidateCookie(Packet *p, struct sockaddr_storage *addr,
   Packet golden;
   golden.packet_type = PACKET_TYPE_HANDSHAKE;
   golden.usec_per_pkt = p->usec_per_pkt;
-  if (p->data.handshake.cookie_epoch == cookie_epoch) {
-    CalculateCookieWithSecret(&golden, addr, addr_len, cookie_secret,
-                              sizeof(cookie_secret));
-  } else {
-    CalculateCookieWithSecret(&golden, addr, addr_len, prev_cookie_secret,
-                              sizeof(prev_cookie_secret));
+  unsigned char *secret = cookie_secret;
+  size_t secret_len = sizeof(cookie_secret);
+  if (p->data.handshake.cookie_epoch == prev_cookie_epoch) {
+    secret = prev_cookie_secret;
+    secret_len = sizeof(prev_cookie_secret);
   }
+  CalculateCookieWithSecret(&golden, addr, addr_len, secret, secret_len);
   DLOG("Handshake: cookie epoch=%d, cookie=0x",
        p->data.handshake.cookie_epoch);
   debug_print_hex(p->data.handshake.cookie, sizeof(p->data.handshake.cookie));
@@ -229,12 +242,15 @@ bool Sessions::ValidateCookie(Packet *p, struct sockaddr_storage *addr,
   return true;
 }
 
-void Sessions::MaybeRotateCookieSecrets() {
-  // Round off the unix timestamp to 64 seconds as an epoch, so we don't have to
-  // track which ones we've already used.
-  uint32_t new_epoch = time(NULL) >> 6;
-  if (new_epoch != cookie_epoch) {
-    RotateCookieSecrets(new_epoch);
+void Sessions::MaybeRotateCookieSecrets(uint32_t now, int is_server) {
+  if (is_server && (now - last_secret_update_time) > 1000000) {
+    // Round off the unix timestamp to 64 seconds as an epoch, so we don't have
+    // to track which ones we've already used.
+    uint32_t new_epoch = time(NULL) >> 6;
+    if (new_epoch != cookie_epoch) {
+      RotateCookieSecrets(new_epoch);
+    }
+    last_secret_update_time = now;
   }
 }
 
@@ -897,10 +913,11 @@ void handle_ack_packet(struct Session *s, uint32_t now) {
   s->last_rxtime = rxtime;
 }
 
-int isoping_main(int argc, char **argv) {
+int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock) {
+  assert(sessions != NULL);
+
   struct sockaddr_in6 listenaddr;
   struct addrinfo *ai = NULL;
-  int sock = -1;
 
   setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -943,7 +960,7 @@ int isoping_main(int argc, char **argv) {
     }
   }
 
-  sock = socket(PF_INET6, SOCK_DGRAM, 0);
+  int sock = socket(PF_INET6, SOCK_DGRAM, 0);
   if (sock < 0) {
     perror("socket");
     return 1;
@@ -951,7 +968,6 @@ int isoping_main(int argc, char **argv) {
 
   int is_server;
   uint32_t now = ustime();       // current time
-  Sessions sessions;
 
   if (argc - optind == 0) {
     is_server = 1;
@@ -988,8 +1004,9 @@ int isoping_main(int argc, char **argv) {
       perror("connect");
       return 1;
     }
-    sessions.NewSession(now, 1e6 / packets_per_sec,
-                        (struct sockaddr_storage *)ai->ai_addr, ai->ai_addrlen);
+    sessions->NewSession(now, 1e6 / packets_per_sec,
+                         (struct sockaddr_storage *)ai->ai_addr,
+                         ai->ai_addrlen);
   } else {
     usage_and_die(argv[0]);
   }
@@ -1018,24 +1035,29 @@ int isoping_main(int argc, char **argv) {
   act.sa_flags = SA_RESETHAND;
   sigaction(SIGINT, &act, NULL);
 
-  uint32_t last_secret_update_time = 0;
-
   while (!want_to_die) {
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(sock, &rfds);
+    if (extrasock > 0) {
+      FD_SET(extrasock, &rfds);
+    }
     struct timeval tv;
     tv.tv_sec = 0;
 
     now = ustime();
-    if (sessions.next_sends.size() == 0 ||
-        DIFF(sessions.next_send_time(), now) < 0) {
+    if (sessions->next_sends.size() == 0 ||
+        DIFF(sessions->next_send_time(), now) < 0 ||
+        extrasock > 0) {
       tv.tv_usec = 0;
     } else {
-      tv.tv_usec = DIFF(sessions.next_send_time(), now);
+      tv.tv_usec = DIFF(sessions->next_send_time(), now);
     }
-    int nfds = select(sock + 1, &rfds, NULL, NULL,
-                      sessions.next_sends.size() > 0 ? &tv : NULL);
+    struct timeval *tvp = NULL;
+    if (sessions->next_sends.size() > 0 || extrasock > 0) {
+      tvp = &tv;
+    }
+    int nfds = select(std::max(sock, extrasock) + 1, &rfds, NULL, NULL, tvp);
     now = ustime();
     if (nfds < 0 && errno != EINTR) {
       perror("select");
@@ -1043,29 +1065,32 @@ int isoping_main(int argc, char **argv) {
     }
 
     // Periodically check if the cookie secrets need updating.
-    if (is_server && (now - last_secret_update_time) > 1000000) {
-      sessions.MaybeRotateCookieSecrets();
-      last_secret_update_time = now;
-    }
+    sessions->MaybeRotateCookieSecrets(now, is_server);
 
-    int err = send_waiting_packets(&sessions, sock, now, is_server);
+    int err = send_waiting_packets(sessions, sock, now, is_server);
     if (err != 0) {
       return err;
     }
 
     if (nfds > 0) {
-      err = read_incoming_packet(&sessions, sock, now, is_server);
+      int s = FD_ISSET(sock, &rfds) ? sock : extrasock;
+      err = read_incoming_packet(sessions, s, now, is_server);
       if (!is_server && err == ECONNREFUSED) return 2;
       if (err != 0) {
         continue;
       }
+    }
+
+    if (extrasock > 0 && nfds == 0) {
+      DLOG("read all data from extrasock, exiting\n");
+      exit(0);
     }
   }
 
   // TODO(pmccurdy): Separate out per-client and global stats, print stats for
   // the server when each client disconnects.
   if (!is_server) {
-    Session &s = sessions.session_map.begin()->second;
+    Session &s = sessions->session_map.begin()->second;
     printf("\n---\n");
     printf("tx: min/avg/max/mdev = %.2f/%.2f/%.2f/%.2f ms\n",
            s.lat_tx_min / 1000.0,
