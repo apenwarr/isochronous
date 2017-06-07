@@ -35,6 +35,11 @@ struct msg {
   u_int32_t size;
 };
 
+struct logger {
+  struct msg msg;
+  struct timeval ts;
+};
+
 void htonmsg(struct msg *m)
 {
 #define sw(x) x = htonl(x)
@@ -261,7 +266,10 @@ int main(int argc, char *argv[])
 
     ntohmsg(tm); /* swap some fields back so we can use them below */
 
+    struct logger log[tm->n];
+    memset(log,0,tm->n * sizeof(struct logger));
     do {
+
       struct pollfd ps = { .fd = s, .events = POLLIN };
 
       r = poll(&ps, 1, 500);
@@ -288,6 +296,9 @@ int main(int argc, char *argv[])
           fprintf(stderr, "wrong cookie value\n");
           continue;
         }
+	if (rm->n < tm->n) {
+		memcpy(&log[rm->n].msg,rm,sizeof(struct msg));
+	}
         if (count > 0 && rm->n < recent)
           out_of_order++;
         if (count > 0 && rm->n == recent)
@@ -314,7 +325,13 @@ int main(int argc, char *argv[])
     if (count > 0 || error == 0) {
       printf("%d bytes -- received %d of %d -- %d consecutive %d ooo %d dups\n",
 	     tm->size, count, tm->n, consecutive, out_of_order, adjacent_dups);
+      for(int i = 0; i < tm->n; i++) {
+	if(log[i].msg.n > 0) printf("."); else printf(" ");
+	  if(i%72==0) printf("\n");
+	}
+      printf("\n");
     }
+
     /*end of client */
   }
   return error;
