@@ -4,6 +4,8 @@ CXXFLAGS+=-std=c++11 -g
 UNAME := $(shell uname -s)
 ifneq ($(UNAME),Darwin)
 LDFLAGS+=-lrt -lm
+else
+CXXFLAGS+=-I/usr/local/opt/openssl/include
 endif
 
 PROGS=udpstress isoping isostream
