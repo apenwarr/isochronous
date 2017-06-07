@@ -49,7 +49,7 @@
 #define MAGIC 0x424c4950
 #define SERVER_PORT 4948
 #define DEFAULT_PACKETS_PER_SEC 10.0
-#define DEFAULT_TTL 2
+#define DEFAULT_TTL 32
 
 // A 'cycle' is the amount of time we can assume our calibration between
 // the local and remote monotonic clocks is reasonably valid.  It seems
