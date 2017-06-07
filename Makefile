@@ -16,7 +16,7 @@ udpstress: udpstress.c dscp.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 isoping: isoping.cc isoping_main.cc
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS) -lcrypto
 
 isostream: isostream.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

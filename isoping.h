@@ -115,7 +115,7 @@ struct Session {
 // address family first, then on the IPv4/6 address, then the port number.
 struct CompareSockaddr {
   bool operator()(const struct sockaddr_storage &lhs,
-                  const struct sockaddr_storage &rhs);
+                  const struct sockaddr_storage &rhs) const;
 };
 
 typedef std::map<struct sockaddr_storage, Session, CompareSockaddr>

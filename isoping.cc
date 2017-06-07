@@ -336,7 +336,7 @@ void set_packets_per_sec(double new_pps) {
 }
 
 bool CompareSockaddr::operator()(const struct sockaddr_storage &lhs,
-                                 const struct sockaddr_storage &rhs) {
+                                 const struct sockaddr_storage &rhs) const {
   if (lhs.ss_family != rhs.ss_family) {
     return lhs.ss_family < rhs.ss_family;
   }
@@ -1062,8 +1062,10 @@ int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock) {
   sigaction(SIGINT, &act, NULL);
 
   while (!want_to_die) {
-    fd_set rfds;
+    fd_set rfds, wfds, xfds;
     FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_ZERO(&xfds);
     FD_SET(sock, &rfds);
     if (extrasock > 0) {
       FD_SET(extrasock, &rfds);
@@ -1083,7 +1085,7 @@ int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock) {
     if (sessions->next_sends.size() > 0 || extrasock > 0) {
       tvp = &tv;
     }
-    int nfds = select(std::max(sock, extrasock) + 1, &rfds, NULL, NULL, tvp);
+    int nfds = select(std::max(sock, extrasock) + 1, &rfds, &wfds, &xfds, tvp);
     now = ustime64();
     if (nfds < 0 && errno != EINTR) {
       perror("select");
