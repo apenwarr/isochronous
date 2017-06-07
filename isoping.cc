@@ -70,6 +70,8 @@
 int is_server = 1;
 int quiet = 0;
 int ttl = DEFAULT_TTL;
+int ecn = 0;
+int dscp = 0; // 0x22
 int want_timestamps = 0;
 double packets_per_sec = DEFAULT_PACKETS_PER_SEC;
 double prints_per_sec = -1.0;
@@ -157,6 +159,8 @@ static void usage_and_die(char *argv0) {
           "      -r <pps>        packets per second (default=%g)\n"
           "      -t <ttl>        packet ttl to use (default=2 for safety)\n"
           "      -q              quiet mode (don't print packets)\n"
+          "      -D <dscp>       dscp value\n"
+          "      -E              enable ecn\n"
           "      -T              print timestamps\n",
           argv0, argv0, (double)DEFAULT_PACKETS_PER_SEC);
   exit(99);
@@ -450,7 +454,7 @@ int isoping_main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);
 
   int c;
-  while ((c = getopt(argc, argv, "f:r:t:qTh?")) >= 0) {
+  while ((c = getopt(argc, argv, "f:r:qt:D:ETh?")) >= 0) {
     switch (c) {
     case 'f':
       prints_per_sec = atof(optarg);
@@ -476,6 +480,12 @@ int isoping_main(int argc, char **argv) {
       break;
     case 'q':
       quiet = 1;
+      break;
+    case 'D':
+      dscp = atoi(optarg);
+      break;
+    case 'E':
+      ecn = 2;
       break;
     case 'T':
       want_timestamps = 1;
@@ -551,6 +561,14 @@ int isoping_main(int argc, char **argv) {
       perror("setsockopt(TTLv4)");
       return 1;
     }
+  }
+
+  dscp |= ecn;
+  if (setsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, &dscp, sizeof(dscp))) {
+    perror("setsockopt IPv6 TCLASS");
+  }
+  if (setsockopt(sock, IPPROTO_IP, IP_TOS, &dscp, sizeof(dscp))) {
+    perror("setsockopt TOS");
   }
 
   uint32_t now = ustime();       // current time

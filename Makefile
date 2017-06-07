@@ -1,10 +1,10 @@
-CFLAGS+=-std=gnu99
+CFLAGS+=-std=gnu99 -g
 LDFLAGS+=-lrt -lm
-PROGS=udpburst isoping isostream
+PROGS=udpstress isoping isostream
 
 all: $(PROGS)
 
-udpburst: udpburst.c
+udpstress: udpstress.c dscp.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 isoping: isoping.c

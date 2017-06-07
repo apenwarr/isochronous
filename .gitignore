@@ -1,4 +1,5 @@
 *~
+*.o
 isoping
 isostream
 udpburst
