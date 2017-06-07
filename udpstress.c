@@ -152,29 +152,10 @@ uint32_t next_dscp(int ecn, const uint8_t *dscp_range)
 }
 
 
-/* This generally does not manage to set the tos field reliably 
-   and I'm retaining it for a future test to see what happens */
-
-void sweep_dscp_setsockopt(int s, int ecn, uint8_t *dscp_range)
-{
-  static int cur = 0;
-  int dscp = dscp_range[cur] | ecn;
-  if ( setsockopt( s, IPPROTO_IPV6, IPV6_TCLASS, &dscp, sizeof (dscp)) < 0 ) {
-    //   perror( "setsockopt( IPV6_TCLASS )" );
-  }
-  if ( setsockopt( s, IPPROTO_IP, IP_TOS, &dscp, sizeof (dscp)) < 0 ) {
-    perror( "setsockopt( IP_TOS )" );
-  }
-  if (dscp_range[++cur] == -1) cur = 0;
-}
-
 struct socket_fd {
   int fd;
   int type;
 };
-
-int test_burst(void) {
-}
 
 int server(void)
 {
@@ -588,9 +569,9 @@ int main(int argc, char *argv[])
 	
 	struct cmsghdr *ecn_hdr = CMSG_FIRSTHDR( &header );
 	if ( ecn_hdr
-	     && ((ecn_hdr->cmsg_level == IPPROTO_IP)
-		 && (ecn_hdr->cmsg_type == IP_TOS) 
-		 || ((ecn_hdr->cmsg_level == IPPROTO_IPV6)
+	     && ((ecn_hdr->cmsg_level == IPPROTO_IP
+		  && ecn_hdr->cmsg_type == IP_TOS) 
+		 || (ecn_hdr->cmsg_level == IPPROTO_IPV6
 		     && ecn_hdr->cmsg_type == IPV6_TCLASS)))
 	  {
 	  ecn_octet_p = (uint8_t *)CMSG_DATA( ecn_hdr );

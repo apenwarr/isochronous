@@ -369,12 +369,17 @@ int run_client(const char *remotename, const char *ifr_name,
       }
 
       if (ifr_name) {
+#ifdef SO_BINDTODEVICE
         fprintf(stderr, "binding to interface %s\n", ifr_name);
         if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
                        ifr_name, strlen(ifr_name)) < 0) {
           perror("setsockopt(SO_BINDTODEVICE)");
           return 1;
         }
+#else
+        fprintf(stderr, "SO_BINDTODEVICE not available; don't use -i\n");
+        return 1;
+#endif
       }
 
       fprintf(stderr, "connecting to %s...\n", sockaddr_to_str(ai->ai_addr));

@@ -568,7 +568,9 @@ int isoping_main(int argc, char **argv) {
     perror("setsockopt IPv6 TCLASS");
   }
   if (setsockopt(sock, IPPROTO_IP, IP_TOS, &dscp, sizeof(dscp))) {
-    perror("setsockopt TOS");
+    if (errno != EINVAL) {
+      perror("setsockopt TOS");
+    }
   }
 
   uint32_t now = ustime();       // current time
