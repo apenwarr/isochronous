@@ -1081,6 +1081,8 @@ int isoping_main(int argc, char **argv, Sessions *sessions, int extrasock) {
     } else {
       tv.tv_usec = DIFF(sessions->next_send_time(), now);
     }
+    tv.tv_sec = tv.tv_usec / 1000000;
+    tv.tv_usec = tv.tv_usec % 1000000;
     struct timeval *tvp = NULL;
     if (sessions->next_sends.size() > 0 || extrasock > 0) {
       tvp = &tv;
