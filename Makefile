@@ -5,7 +5,8 @@ UNAME := $(shell uname -s)
 ifneq ($(UNAME),Darwin)
 LDFLAGS+=-lrt -lm
 else
-CXXFLAGS+=-I/usr/local/opt/openssl/include
+CXXFLAGS+=-I/usr/local/opt/openssl@1.1/include
+LDFLAGS+=-L/usr/local/opt/openssl@1.1/lib
 endif
 
 PROGS=udpstress isoping isostream

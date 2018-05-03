@@ -168,11 +168,11 @@ Sessions::Sessions()
       cookie_epoch(0),
       last_secret_update_time(0) {
   NewRandomCookieSecret();
-  EVP_MD_CTX_init(&digest_context);
+  digest_context = EVP_MD_CTX_new();
 }
 
 Sessions::~Sessions() {
-  EVP_MD_CTX_cleanup(&digest_context);
+  EVP_MD_CTX_free(digest_context);
 }
 
 bool Sessions::CalculateCookie(Packet *p, struct sockaddr_storage *remoteaddr,
@@ -190,18 +190,18 @@ bool Sessions::CalculateCookieWithSecret(Packet *p,
     fprintf(stderr, "Tried to create cookie for a non-handshake packet\n");
     return false;
   }
-  if (!EVP_DigestInit_ex(&digest_context, md, NULL)) {
+  if (!EVP_DigestInit_ex(digest_context, md, NULL)) {
     fprintf(stderr, "Unable to initialize hash digest\n");
     return false;
   }
 
   // Hash the data
-  EVP_DigestUpdate(&digest_context, secret, secret_len);
-  EVP_DigestUpdate(&digest_context, &p->usec_per_pkt, sizeof(p->usec_per_pkt));
-  EVP_DigestUpdate(&digest_context, remoteaddr, remoteaddr_len);
+  EVP_DigestUpdate(digest_context, secret, secret_len);
+  EVP_DigestUpdate(digest_context, &p->usec_per_pkt, sizeof(p->usec_per_pkt));
+  EVP_DigestUpdate(digest_context, remoteaddr, remoteaddr_len);
 
   unsigned int digest_size = 0;
-  EVP_DigestFinal_ex(&digest_context, p->data.handshake.cookie, &digest_size);
+  EVP_DigestFinal_ex(digest_context, p->data.handshake.cookie, &digest_size);
   if (digest_size != COOKIE_SIZE) {
     fprintf(stderr, "Invalid digest size %d for cookie; expected %d\n",
             digest_size, COOKIE_SIZE);

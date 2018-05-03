@@ -176,7 +176,7 @@ class Sessions {
                                  size_t secret_len);
 
   // Fields required for calculating and verifying cookies.
-  EVP_MD_CTX digest_context;
+  EVP_MD_CTX *digest_context;
   const EVP_MD *md;
   std::mt19937_64 rng;
   uint32_t cookie_epoch;
